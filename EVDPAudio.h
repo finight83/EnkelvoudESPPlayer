@@ -378,9 +378,8 @@ inline void audioHzDiagRollover() {
     g_hz_diag.zc_count    = 0;
 }
 
-// Hardened playout path: cap drift correction to 1 sample/frame, decay toward
-// 0 automatically when the queue is healthy, and avoid rebuffer churn caused
-// by minor timing noise. This keeps the stream smooth under Wi-Fi jitter.
+// Render each decoded frame at its original length. Queue occupancy is not a
+// measurement of the independently clocked I2S DMA's sample consumption.
 inline void process_and_output_audio(const int16_t* in_pcm, int samples_per_channel) {
     if (!in_pcm || samples_per_channel <= 0 || !dac1_output_buffer || !dac2_output_buffer) return;
 
@@ -407,468 +406,12 @@ inline void process_and_output_audio(const int16_t* in_pcm, int samples_per_chan
         ? (node_volume_multiplier * zone_volume_multiplier)
         : 0.0f;
 
-    int correction = 0;
-
-    if (server_clock_synced && audio_queue != nullptr) {
-        int qdepth = (int)uxQueueMessagesWaiting(audio_queue);
-        int err    = qdepth - (int)audio_queue_target;
-
-        // [corrector-sign-fixed]
-        // SIGN INVERSION BUG: err > 0 means the queue is DEEPER than
-        // target. To drain it we need MORE out_samples consumed per
-        // input — i.e. a POSITIVE correction (out_samples =
-        // samples_per_channel - correction shrinks). The old table set
-        // target = -1.0f on err > 8, which fills the queue instead of
-        // draining it. Thresholds also lowered from 6/8 to 0/2 so the
-        // corrector engages on the observed +2 steady-state overshoot
-        // (queue 8, target 6) instead of waiting for +7, which never
-        // happens. Field signature this fixes: queueError:2,
-        // correctionSamples:0, leadBelow20LastSec:51, minLeadMsLastSec:3
-        // → every frame within 6 ms of deadline → starve every 30-60 s.
-        // [corrector-sign-and-decay-fixed]
-        // Two independent bugs in the corrector path, both fixed here:
-        //
-        //  1. SIGN INVERTED. err > 0 means queue deeper than target, which
-        //     needs a POSITIVE target to drain (out_samples = input −
-        //     correction shrinks when correction is positive). Original
-        //     code set target = −1.0 on err > 8, filling the queue. All
-        //     four branches had the wrong sign.
-        //
-        //  2. DECAY INERT. `abs(err) <= 6` meant any err 0..6 went
-        //     straight to the decay branch. Combined with the 0.8 gain
-        //     and 0.05 snap, `smooth` cycled 0.05 → 0.04 → 0 every frame
-        //     and correction never accumulated. Field signature:
-        //     queueError:2, correctionSamples:0, leadBelow20LastSec:51,
-        //     minLeadMsLastSec:3 — every frame within 6 ms of deadline,
-        //     ~1 audible drop per 5 s.
-        //
-        // Threshold 2 means the corrector engages at err 2+ (your
-        // observed steady state) and only decays in the ±2 deadband.
-        // Snap threshold 0.02 (was 0.05) lets small smooth values
-        // survive the 0.8 decay instead of collapsing to 0.
-        // [corrector-sign-and-decay-fixed]
-        // Two independent bugs in the corrector path, both fixed here:
-        //
-        //  1. SIGN INVERTED. err > 0 means queue deeper than target, which
-        //     needs a POSITIVE target to drain (out_samples = input −
-        //     correction shrinks when correction is positive). Original
-        //     code set target = −1.0 on err > 8, filling the queue. All
-        //     four branches had the wrong sign.
-        //
-        //  2. DECAY INERT. `abs(err) <= 6` meant any err 0..6 went
-        //     straight to the decay branch. Combined with the 0.8 gain
-        //     and 0.05 snap, `smooth` cycled 0.05 → 0.04 → 0 every frame
-        //     and correction never accumulated. Field signature:
-        //     queueError:2, correctionSamples:0, leadBelow20LastSec:51,
-        //     minLeadMsLastSec:3 — every frame within 6 ms of deadline,
-        //     ~1 audible drop per 5 s.
-        //
-        // Threshold 2 means the corrector engages at err 2+ (your
-        // observed steady state) and only decays in the ±2 deadband.
-        // Snap threshold 0.02 (was 0.05) lets small smooth values
-        // survive the 0.8 decay instead of collapsing to 0.
-        // [corrector-step-reverted] Back to the original step function
-        // capped at 1.0. FIX 2's proportional 2/4/8 ramp made the
-        // corrector pitch-shift by 2-8 samples/frame during the
-        // observed err=2 steady state (target=6, actual=8 due to the
-        // -2 safety margin in applyDelayToQueueTarget). 2 samples
-        // skipped per 960 = 10 ms beat = 100 Hz buzz. 8 samples =
-        // 400 Hz whine. Both disappear when max correction is 1.
-        // [corrector-proportional-v2]
-        // The old step-function target (+/-1 for |err| >= 2) plus the
-        // `abs(err) < 4` decay gate combined into a corrector that
-        // could not recover from a 1-frame deficit at all. Observed
-        // field state at 200 ms server bufferMs, 204 ms effective
-        // latency, node queue 2 / target 3, err = -1:
-        //   * target -> -0.5, slew 0.05/frame, decay 0.8/frame
-        //   * steady-state smooth -> -0.2, fill rate 10 samples/sec
-        //   * 960 samples / 10 = 96 s to fill one frame
-        //   * meanwhile 18.4 frames/sec arrive within 20 ms of
-        //     deadline (minLead -3 observed)
-        //   * corrector fires 10x/sec doing 1-sample interpolation
-        //   * audible result: continuous 10 Hz micro-flutter
-        //
-        // New design:
-        //   * target = err * 1.5 (proportional), clamped +/-8
-        //   * No decay except at err == 0 (idle only when on target)
-        //   * Slew 0.15/frame (3x faster) so step change settles in
-        //     ~4 frames instead of 20
-        //   * Per-frame cap scales with |err|: fills a 1-frame deficit
-        //     in ~13 s instead of ~96 s, drains a 4-frame overflow in
-        //     ~2 s instead of ~48 s.
-        //
-        // Trade-off: a 1-frame deficit now induces a 0.15% pitch shift
-        // for ~13 s (barely perceptible slow drift) instead of a
-        // persistent 10 Hz flutter. 2-frame and larger deficits recover
-        // fast enough that the audible effect is one brief glide, not
-        // a sustained condition.
-        // [corrector-no-engage-at-steady-state]
-        //
-        // Field data (2026-11-03, node at bufferMs=300, network latency
-        // 70 ms) shows the queue settling at 11-12 frames against a
-        // target of 9. err is +2 to +3. That is NOT a fault:
-        //   playout_delay_ms      = 300 ms
-        //   network_latency_ms    = 70 ms
-        //   natural queue dwell   = (300 - 70) / 20 = 11.5 frames
-        //   applyDelayToQueueTarget() subtracts a hard-coded -2 safety,
-        //   so target = 9 and err = +2.5 at ALL TIMES.
-        //
-        // The previous `target = err * 1.5` produced target=+3 at err=+2,
-        // so the corrector engaged on 100% of frames and produced 957
-        // out of 960 samples per frame. The I2S DMA clock is fixed at
-        // 48 kHz, so 957 samples play in 19.94 ms and the DMA underruns
-        // for 62 us every 20 ms frame -> 50 Hz scratch. That is the
-        // "still scratchy" the user is hearing.
-        //
-        // The corrector does not drain the audio_queue: dequeue rate is
-        // dictated by the playout deadline (one frame per captured_ms
-        // gap = 50 fps regardless of out_samples), so shrinking the
-        // frame only inserts silence, it does not remove queued audio.
-        // Therefore widening the deadband to exclude the natural
-        // steady-state err is both safe and necessary.
-        //
-        // Engagement thresholds:
-        //   |err| <= 2 : no correction (natural playout-delay slack)
-        //   |err| == 3 : +/- 1 sample  = 0.1 % pitch shift = inaudible
-        //   |err| >= 4 : +/- 2 samples = 0.2 % pitch shift, brief
-        // [corrector-deadband-covers-natural-dwell]
-        //
-        // The natural queue dwell at bufferMs=300 / networkLatency=70
-        // is (300 - 70) / 20 = 11.5 frames. applyDelayToQueueTarget()
-        // subtracts a hard-coded -2 safety, so target = 9 and err = +2.5
-        // in steady state. Field diagnostics consistently show q=11-12,
-        // err=+2 to +3.
-        //
-        // The previous ±2 deadband left err=+3 outside, firing the
-        // corrector 25-50x/sec. That is:
-        //   - 0.05 % pitch shift on 25-50 % of frames
-        //   - 20 us DMA underrun on every firing frame
-        //   - perceived as a persistent faint roughness on sustained notes
-        //
-        // Widening the deadband to ±3 makes the corrector fully idle for
-        // the entire natural dwell range. It only engages at err ≥ 4
-        // (queue ≥ 13), which is exactly the threshold where drop_at
-        // (dwell_frames + 2 = 13) is about to drop frames anyway. So:
-        //   - queue 11-12 (normal): corrector idle, no artifacts
-        //   - queue 13 (drop_at):   drop_one frame, corrector still idle
-        //   - queue 14+ (drift):    corrector + drop_at both engage
-        //
-        // [corrector-deadband-real]
-        // Was err >= 2 to engage. Since the deadline pacer holds frames
-        // for their capture-time deadline (see the wait_ms loop below),
-        // a stable queue at ANY depth costs 0 frames/sec — the corrector
-        // cannot drain it no matter what value it emits. Engaging at
-        // err=2 or err=4 therefore buys zero rate correction and pays
-        // 0.08 % constant pitch shift (graininess) forever. The observed
-        // steady state on this fleet is queue=7, target=3, err=4, so the
-        // old thresholds ran the corrector at 41-51/50 duty in every
-        // sample of a 100 s recording (see node-diag recordings
-        // enkelvoud-node-diag-2026-11-04T14-24-*.txt).
-        //
-        // Engage only when the queue is genuinely about to overflow
-        // (drop_at = dwell_frames + 2 ≈ 11) or underflow (PLC path at
-        // err <= -8). err <= 5 is treated as the natural settle point
-        // and decays to 0.
-        // [corrector-rate-trim-deadband]
-        // Was: discrete engage at |err| >= 6 only. Steady state on the
-        // 2026-11-15 diagnostic is err = 2..3 (queue 4-5, target 2-3),
-        // so the corrector never fired (crr = 0 for 600 s). The 60 ppm
-        // source-vs-DAC crystal drift therefore accumulated unchecked
-        // until the queue grew one frame past drop_at, at which point
-        // exactly one frame was discarded and PLC filled its slot:
-        // disc/conc tick in lockstep every 10-11 s. That is the
-        // "stutter every few seconds" the operator reports -- not the
-        // 55 s WiFi scan (see t=8: pkt=50, gap=24, disc unchanged).
-        //
-        // Add graduated tiers down to err=1. Target is chosen so the
-        // effective correction rate (target * 50 fps) covers the
-        // observed 60 ppm drift at err=1 (target=0.06 => 60 ppm),
-        // doubles at err=2 (0.12 => 120 ppm, drains residual), and
-        // escalates smoothly to the old full-rate engage at err>=8.
-        // The tier structure matters: a single low threshold with a
-        // flat target would either over-drain (buzz) or under-drain
-        // (back to 10 s discards). Graduating keeps the engagement
-        // rate proportional to the queue error at every magnitude.
-        float target = 0.0f;
-        if      (err >=  8) target =  1.00f;
-        else if (err >=  6) target =  0.50f;
-        else if (err >=  4) target =  0.30f;
-        else if (err >=  3) target =  0.20f;
-        else if (err >=  2) target =  0.12f;
-        else if (err >=  1) target =  0.06f;
-        else if (err <= -8) target = -1.00f;
-        else if (err <= -6) target = -0.50f;
-        else if (err <= -4) target = -0.30f;
-        else if (err <= -3) target = -0.20f;
-        else if (err <= -2) target = -0.12f;
-        else if (err <= -1) target = -0.06f;
-
-        g_queue_drift = g_queue_drift * 0.96f + 0.04f * (float)err;
-        if (g_queue_drift >  1.0f) g_queue_drift =  1.0f;
-        if (g_queue_drift < -1.0f) g_queue_drift = -1.0f;
-
-        // [corrector-drift-nudge-gated-on-engage]
-        // The previous version computed combined = target + drift * 0.10
-        // unconditionally. At the observed steady state (queue=7, target=3,
-        // err=4, drift=4) target is correctly zero but combined = 0.4, so
-        // g_correction_smooth locked at 0.32–0.40 and the corrector fired
-        // ~20 times/sec — 0.1 % pitch shift every 50 ms. Audible as
-        // continuous graininess. Confirmed by the difference between the
-        // old recording (correctorFramesLastSec: 41–51, err>=2) and the
-        // expected steady state (0 at err<6).
-        //
-        // The drift nudge exists to bias the slew toward small residuals
-        // during ACTIVE engagement (|err|>=6). It must not operate when
-        // target is zero, or it recreates the exact bug the engage
-        // threshold was raised to fix.
-        // [corrector-drift-nudge-scaled]
-        // Was 0.10. With target thresholds now down to err=1, the drift
-        // term at steady state (g_queue_drift clamped to 1.0) would add
-        // +0.10 on top of target=0.06, giving 160 ppm where 60 ppm is
-        // needed -- a 2.7x over-correction that drains the queue to 0
-        // and then oscillates back to err=2. That is the exact failure
-        // mode the original 0.10 coefficient was tuned against (see
-        // [corrector-drift-nudge-gated-on-engage] above), only now
-        // triggered by the low tiers instead of the high ones.
-        // 0.02 keeps the drift term's beneficial role during genuine
-        // engagement (err>=6, target=0.5, combined=0.52 -- 540 ppm,
-        // drains fast) while leaving the steady-state tiers effectively
-        // pure-target. Combined with the tiered thresholds above, the
-        // corrector reaches equilibrium at err=1 with combined=0.06.
-        float combined;
-        if (fabsf(target) < 0.01f) {
-            combined = 0.0f;
-        } else {
-            combined = target + g_queue_drift * 0.02f;
-        }
-
-        const float slew = 0.15f;
-        if      (combined > g_correction_smooth + slew) g_correction_smooth += slew;
-        else if (combined < g_correction_smooth - slew) g_correction_smooth -= slew;
-        else                                            g_correction_smooth = combined;
-
-        // [decay-only-on-target]
-        // The old `abs(err) < 4` gate decayed even at err=2-3, which
-        // actively FOUGHT the drain target: field signal queue=7,
-        // target=5, err=+2, corrector produced no net drain because
-        // the slew toward +1 was cancelled by a 0.8x decay back to 0.
-        // Decay only when truly on target.
-        // [corrector-idle-at-natural-steady-state]
-        // The previous `err == 0` gate only let the corrector decay when
-        // the queue was EXACTLY on target. Field steady state is err=+2
-        // (see [corrector-no-engage-at-steady-state] above), so the
-        // corrector never decayed and stayed latched at +3 samples/frame
-        // forever. Widen the decay window to the same ±2 deadband the
-        // engagement uses; anything inside the band is the natural
-        // playout-delay slack, not a tracking error.
-        // [corrector-decay-matches-engage]
-        // Keep the decay window identical to the engagement deadband.
-        // A mismatch (decay at ≤2 but engage at ≥3) left a permanent
-        // non-decayed residual at err=3. Matching the two eliminates
-        // the residual entirely.
-        // [corrector-decay-matches-engage]
-        // Decay whenever the engage block above did NOT raise `target`.
-        // Keeps the corrector idle at the observed steady state
-        // (queue=7, target=3, err=4) instead of slewing to +1 forever.
-        // The deadband is now strictly larger than the engage threshold
-        // (engage at |err| >= 6, decay at |err| < 6) so there is no
-        // simultaneous-slew-and-decay fight.
-        if (fabsf(target) < 0.01f) {
-            g_correction_smooth *= 0.80f;
-            if (fabsf(g_correction_smooth) < 0.02f) g_correction_smooth = 0.0f;
-        }
-
-        g_correction_accum += g_correction_smooth;
-        correction = (int)g_correction_accum;
-        g_correction_accum -= (float)correction;
-
-        // [corrector-cap-scales-with-err]
-        // Flat +/-1 cap = one-frame deficit takes 96 s to fill. Scaled
-        // cap: 1-frame fill in ~13 s, 4-frame overflow in ~2 s. The
-        // worst-case audible artifact is a brief 0.3-0.6 % pitch glide
-        // during recovery, then clean audio — vastly preferable to a
-        // permanent 10 Hz micro-flutter at 0.1 % amplitude.
-        // [corrector-cap-matches-dma-budget]
-        // With the widened deadband above, the corrector only reaches
-        // this block when |err| >= 3. Cap the correction at ±2 samples
-        // (= 0.2 % pitch, ~4 cents) so the DMA underrun per frame is
-        // at most 2 samples (41 us). The faded fade-in below masks the
-        // boundary when correction != 0, so even a fully engaged
-        // corrector does not produce an audible click.
-        // [corrector-cap-matches-deadband]
-        // Same deadband as the target selection above.
-        // [corrector-cap-covers-err1]
-        // Was: cap=0 at absErr<2. That blocks the new err=1 tier
-        // entirely -- target is 0.06 there but corrCap clamps the
-        // applied correction to 0 on every frame, so the corrector
-        // would compute a target, fire the slew, accumulate to 1
-        // after 16 frames, and then apply 0. Silent no-op. Raising
-        // the cap to 1 at absErr>=1 lets the err=1 tier actually
-        // apply. The higher tiers are unchanged so the DMA-underrun
-        // budget the [corrector-cap-matches-dma-budget] comment
-        // describes still holds: 4 samples max = 83 us underrun.
-        int absErr = err < 0 ? -err : err;
-        int corrCap;
-        if      (absErr >= 8) corrCap = 4;
-        else if (absErr >= 4) corrCap = 2;
-        else if (absErr >= 1) corrCap = 1;
-        else                  corrCap = 0;
-        if (correction >  corrCap) correction =  corrCap;
-        if (correction < -corrCap) correction = -corrCap;
-        if (g_correction_accum >=  (float)corrCap ||
-            g_correction_accum <= -(float)corrCap)
-            g_correction_accum = 0.0f;
-
-        // [corrector-stuck-watchdog]
-        // Field recording enkelvoud-node-diag-2026-11-13T15:48:54 shows the
-        // corrector firing 6×/sec for the entire 552 s capture on a node
-        // whose queue genuinely sat at depth=1 against target=7 (err=-6).
-        // Every one of those 3,348 fires produced 1 sample of pitch shift
-        // (~0.1 %) and zero queue-depth benefit — the queue drains at a
-        // fixed 50 fps dictated by the playout deadline, so no amount of
-        // per-frame sample stretching changes the depth. The audible effect
-        // is a sustained ~1 Hz flutter that operators describe as "the audio
-        // is playing but it's not quite right".
-        //
-        // This watchdog caps the damage. Any corrector that has been firing
-        // continuously for 10 s (500 consecutive non-zero frames at 50 fps,
-        // counted with a 5-frame tolerance for the 20 ms idle gaps the
-        // corrector naturally produces) is either misconfigured (target
-        // does not match achievable dwell) or fighting a pathological
-        // condition. Force correction to 0 for the next 30 s so audio is
-        // clean, then let it try again. If the condition persists, the
-        // 30 s cooldown + 10 s burn-in means at most 25 % of any 40 s
-        // window is affected, down from 100 %.
-        //
-        // Reset the accumulator inside the watchdog so re-enabling starts
-        // from zero — otherwise the first post-cooldown frame inherits the
-        // stale g_correction_smooth and slams back into the same loop.
-        {
-            static uint32_t stuckFrames     = 0;
-            static uint32_t stuckCooldownMs = 0;
-            uint32_t now_stuck = millis();
-            if (stuckCooldownMs != 0) {
-                if ((int32_t)(now_stuck - stuckCooldownMs) >= 0) {
-                    // Cooldown expired. Allow the corrector to try again.
-                    stuckCooldownMs = 0;
-                    stuckFrames     = 0;
-                    g_correction_smooth = 0.0f;
-                    g_correction_accum  = 0.0f;
-                } else {
-                    // Still in cooldown: force correction to 0 for this frame.
-                    correction          = 0;
-                    g_correction_smooth = 0.0f;
-                    g_correction_accum  = 0.0f;
-                }
-            } else {
-                if (correction != 0) stuckFrames++;
-                else if (stuckFrames > 0) stuckFrames--;   // tolerance, not reset
-                if (stuckFrames >= 500) {
-                    stuckFrames     = 0;
-                    stuckCooldownMs = now_stuck + 30000UL;
-                    correction      = 0;
-                    g_correction_smooth = 0.0f;
-                    g_correction_accum  = 0.0f;
-                    audioLogThrottled(
-                        String("[Audio] corrector STUCK (fired for 10 s at err=") +
-                        String(stat_queue_error) +
-                        " depth=" + String(audio_queue ?
-                            (int)uxQueueMessagesWaiting(audio_queue) : -1) +
-                        " tgt=" + String(audio_queue_target) +
-                        "); disabling for 30 s");
-                }
-            }
-        }
-
-        // [corrector-counter-after-cap] Moved here from before the cap.
-        // Field signature of the old bug: correctorFramesTotal=405 with
-        // err=+2 (queue 12 / target 10, well inside the ±3 deadband) and
-        // minLead=5ms. The corrector was clamped to zero on every one of
-        // those "fires" — accum cycled 0→1→0 each frame from stale
-        // g_correction_smooth left over from the boot transient, the
-        // counter counted the pre-cap value, then the cap set the actual
-        // correction to 0. With this move the counter reports APPLIED
-        // corrections only. In steady state it should read 0.
-        if (correction != 0) {
-            stat_total_correction_samples +=
-                (uint32_t)(correction > 0 ? correction : -correction);
-            stat_corrector_frames_this_sec++;
-            statCorrectorFramesTotal++;
-            if (stat_corrector_frames_this_sec > statCorrectorFramesPeakThisSec) {
-                statCorrectorFramesPeakThisSec = stat_corrector_frames_this_sec;
-            }
-        }
-
-        stat_queue_error        = err;
-        stat_correction_samples = correction;
-    } else if (audio_queue != nullptr) {
-        int qdepth = (int)uxQueueMessagesWaiting(audio_queue);
-        int err    = qdepth - (int)audio_queue_target;
-
-        g_queue_drift = g_queue_drift * 0.90f + 0.10f * (float)err;
-        if (g_queue_drift >  1.0f) g_queue_drift =  1.0f;
-        if (g_queue_drift < -1.0f) g_queue_drift = -1.0f;
-
-        const float slew = 0.05f;
-        if      (g_queue_drift > g_correction_smooth + slew) g_correction_smooth += slew;
-        else if (g_queue_drift < g_correction_smooth - slew) g_correction_smooth -= slew;
-        else                                                g_correction_smooth = g_queue_drift;
-
-        if (abs(err) <= 1) {
-            g_correction_smooth *= 0.75f;
-            if (fabsf(g_correction_smooth) < 0.05f) g_correction_smooth = 0.0f;
-        }
-
-        g_correction_accum += g_correction_smooth;
-        correction = (int)g_correction_accum;
-        g_correction_accum -= (float)correction;
-
-        if (correction >  1) { correction =  1; g_correction_accum = 0.0f; }
-        if (correction < -1) { correction = -1; g_correction_accum = 0.0f; }
-
-        stat_queue_error        = err;
-        stat_correction_samples = correction;
-    }
-
-    // [stutter-event-logging]
-    // The per-second counters on /api/health are the forensic truth, but
-    // the log ring is silent during a corrector burst — nothing on the
-    // audio task logs at the moment the correction fires. That is exactly
-    // the "logs are green 99 % of the time but I can hear it glitch"
-    // report. This puts a breadcrumb in the ring on TRANSITION into and
-    // out of corrector engagement, so the 10-min recorder's Log Lines
-    // section shows WHAT fired and WHEN without the operator correlating
-    // timeline columns by hand.
-    //
-    // One entry per transition, rate-limited to 1/s. A 5 s corrector
-    // burst costs two lines (engaged + idle), not fifty. audioLogThrottled
-    // is used (not log_message) so this path never blocks the UART during
-    // the burst it is trying to observe.
-    {
-        static bool     corrActive  = false;
-        static uint32_t corrStartMs = 0;
-        static uint32_t corrLogMs   = 0;
-        bool corrNow = (correction != 0);
-        if (corrNow && !corrActive && (millis() - corrLogMs) > 1000) {
-            corrLogMs   = millis();
-            corrActive  = true;
-            corrStartMs = corrLogMs;
-            audioLogThrottled(String("[Audio] STUTTER: corrector engaged corr=") +
-                              String(correction) +
-                              " err=" + String(stat_queue_error) +
-                              " depth=" + String(audio_queue ?
-                                  (int)uxQueueMessagesWaiting(audio_queue) : -1) +
-                              " tgt=" + String(audio_queue_target));
-        } else if (!corrNow && corrActive) {
-            corrActive = false;
-            audioLogThrottled(String("[Audio] STUTTER: corrector idle after ") +
-                              String(millis() - corrStartMs) + " ms");
-        }
-    }
-
-    out_samples = samples_per_channel - correction;
-    if (out_samples < 1) out_samples = 1;
-    if (out_samples > OPUS_FRAME_SIZE + 3) out_samples = OPUS_FRAME_SIZE + 3;
+    // Queue depth cannot measure DMA sample consumption; do not trim PCM.
+    // Queue-depth telemetry remains useful, but it does not drive resampling.
+    stat_queue_error = audio_queue ? (int)uxQueueMessagesWaiting(audio_queue)
+                                     - (int)audio_queue_target : 0;
+    stat_correction_samples = 0;
+    out_samples = samples_per_channel;
 
     static float fade_gain = 1.0f;
     static float fade_step = 1.0f / ((float)SAMPLE_RATE * 0.005f);
@@ -985,46 +528,7 @@ inline void process_and_output_audio(const int16_t* in_pcm, int samples_per_chan
     // proceed while the I2S DMA drain runs.
     if (g_audio_config_mutex) xSemaphoreGive(g_audio_config_mutex);
 
-    // [frame-pad-sample-and-hold-only]
-    // When the corrector skips samples, out_samples < samples_per_channel
-    // (960). The I2S DMA plays at 48 kHz fixed; 958 samples play in
-    // 19.96 ms and then the DMA underruns for 42 us. Push exactly
-    // samples_per_channel (960) to the DMA so the frame boundary is
-    // clean: hold the last interpolated sample for the pad count.
-    //
-    // The previous version faded the last 20 samples to 5 % amplitude
-    // AND THEN read the hold value from that same faded sample. Result:
-    // the padded frame ended at 5 % amplitude, and the next frame
-    // started at 100 % — a ~95 % step at every corrector engagement.
-    // At 25 Hz firing rate (corrector fires on alternating frames) that
-    // is an audible click / motorboat during every corrector burst.
-    // Confirmed to be the "occasional weird stutter" symptom: the
-    // corrector is idle at steady state and only fires on >6-frame
-    // drift (roughly every 7 minutes at 100 ppm), so the operator
-    // hears a click burst that vanishes again.
-    //
-    // The pad alone (no fade) is smooth: the last interpolated sample
-    // is a value near input[959], and the next frame's first sample is
-    // the natural continuation input[960]. Holding the last sample for
-    // a couple of slots produces a 42 us zero-slope segment, then the
-    // natural audio step. Inaudible at any frequency: it is the same
-    // step that already exists between any two adjacent frames.
-    //
-    // When correction is 0 (steady state) this block is skipped.
-    if (correction != 0 && out_samples < samples_per_channel) {
-        int16_t holdL1 = dac1_output_buffer[(out_samples - 1) * 2 + 0];
-        int16_t holdR1 = dac1_output_buffer[(out_samples - 1) * 2 + 1];
-        int16_t holdL2 = dac2_output_buffer[(out_samples - 1) * 2 + 0];
-        int16_t holdR2 = dac2_output_buffer[(out_samples - 1) * 2 + 1];
-        for (int i = out_samples; i < samples_per_channel; i++) {
-            dac1_output_buffer[i * 2 + 0] = holdL1;
-            dac1_output_buffer[i * 2 + 1] = holdR1;
-            dac2_output_buffer[i * 2 + 0] = holdL2;
-            dac2_output_buffer[i * 2 + 1] = holdR2;
-        }
-        out_samples = samples_per_channel;
-    }
-
+    // Both DMA paths receive the complete decoded frame.
     const size_t want = (size_t)out_samples * CHANNELS * sizeof(int16_t);
     const size_t slab = 1024;
     size_t off1 = 0, off2 = 0;
@@ -1069,12 +573,27 @@ inline void process_and_output_audio(const int16_t* in_pcm, int samples_per_chan
     if (off1 < want || off2 < want) stat_i2s_timeouts++;
 }
 
+// Keep the stateful decoder in sequence when a queued frame is not played.
+inline void decodeDiscardedAudio(const AudioMessage& msg) {
+    if (!opus_decoder || !pcm_decode_buffer) return;
+    int result = opus_decode(opus_decoder,
+                             msg.conceal ? nullptr : msg.payload,
+                             msg.conceal ? 0 : msg.length,
+                             pcm_decode_buffer, OPUS_FRAME_SIZE, 0);
+    if (result < 0) {
+        stat_opus_decode_errors++;
+        opus_decoder_ctl(opus_decoder, OPUS_RESET_STATE);
+    }
+}
+
 // Hardened flush: clear stale queue data but do not immediately force a second
 // resync loop from a single transient jitter burst.
 inline void flushAudioQueueAndRebuffer(const char* reason) {
     uint32_t drained = 0;
     uint32_t drained_real = 0;
 
+    if (!g_audio_queue_mutex) return;
+    xSemaphoreTake(g_audio_queue_mutex, portMAX_DELAY);
     if (audio_queue != nullptr) {
         AudioMessage tmp;
         while (xQueueReceive(audio_queue, &tmp, 0) == pdPASS) {
@@ -1093,14 +612,8 @@ inline void flushAudioQueueAndRebuffer(const char* reason) {
     g_playout_lead_ms = 0;
     ts_prev_audio_arrival_ms = 0;
     last_conceal_captured_ms = 0;
-    // [flush-resets-corrector]
-    // Clear the corrector integrators so the first frame after rebuffer
-    // does not apply a stale stretch/skip inherited from the pre-flush
-    // queue depth. Also neutralise last_node_latency_ms so drop_at()
-    // re-learns the current link rather than using the pre-flush value.
-    g_correction_smooth = 0.0f;
-    g_correction_accum  = 0.0f;
-    g_queue_drift       = 0.0f;
+    xSemaphoreGive(g_audio_queue_mutex);
+    // Let drop_at() re-learn latency after the flush.
     last_node_latency_ms = 20;
     // [stutter-visible-counters] The first frame after a rebuffer would
     // otherwise register its delta against the pre-flush captured_ms and
@@ -1381,6 +894,7 @@ inline void audioPlaybackTask(void *pvParameters) {
             const int drop_at = dwell_frames + 2;
             if (uxQueueMessagesWaiting(audio_queue) > (UBaseType_t)drop_at) {
                 stat_frames_discarded++;
+                decodeDiscardedAudio(msg);
                 continue;
             }
 
@@ -1405,7 +919,8 @@ inline void audioPlaybackTask(void *pvParameters) {
 
                 int64_t our_local_at_capture =
                     (int64_t)sync_loc + (int32_t)(msg.captured_ms - sync_srv);
-                int64_t net_ms = (int64_t)msg.arrival_ms - our_local_at_capture;
+                int64_t net_ms =
+                    (int32_t)(msg.arrival_ms - (uint32_t)our_local_at_capture);
                 if (net_ms < 0)    net_ms = 0;
                 if (net_ms > 2000) net_ms = 2000;
                 last_node_latency_ms = (uint32_t)net_ms;
@@ -1488,6 +1003,7 @@ inline void audioPlaybackTask(void *pvParameters) {
                     const int64_t frame_ms = (OPUS_FRAME_SIZE * 1000LL) / SAMPLE_RATE;
                     if (wait_ms < -(frame_ms / 2)) {
                         stat_frames_discarded++;
+                        decodeDiscardedAudio(msg);
                         continue;
                     }
                     g_resume_trim = false;
@@ -1519,6 +1035,7 @@ inline void audioPlaybackTask(void *pvParameters) {
             } else if (haveDeadline && late_ms > (int64_t)AUDIO_STALE_DISCARD_MS) {
                 stat_frames_late++;
                 stat_frames_discarded++;
+                decodeDiscardedAudio(msg);
                 stale_streak++;
                 if (stale_streak >= AUDIO_STALE_STREAK_LIMIT) {
                     // [auto-expand-before-streak-flush]

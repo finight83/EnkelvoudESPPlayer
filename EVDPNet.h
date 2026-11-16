@@ -188,11 +188,6 @@ inline void handleServerEpoch(uint32_t epoch) {
     // pre-flash events; without this reset the operator cannot tell
     // "the fix didn't work" from "these are old numbers".
     //
-    // Also reset the corrector integrators: flushAudioQueueAndRebuffer()
-    // already zeroes them on every rebuffer, but an epoch change fires
-    // g_force_resync which the playback task consumes at the top of its
-    // loop; if the flag happens to land while the corrector is mid-
-    // slew, the first post-epoch frames inherit a stale stretch/skip.
     // statLastCapturedMs is reset because otherwise the first frame
     // after the epoch change computes a gap of "old captured_ms +
     // pre-reboot elapsed", spuriously tripping Gt20/Gt40 once per boot.
@@ -205,9 +200,6 @@ inline void handleServerEpoch(uint32_t epoch) {
     statCorrectorFramesPeakThisSec  = 0;
     statCorrectorFramesPeakLastSec  = 0;
     stat_total_correction_samples   = 0;
-    g_correction_smooth             = 0.0f;
-    g_correction_accum              = 0.0f;
-    g_queue_drift                   = 0.0f;
 }
 
 // ---- Encoder info (shared by registration response and ctrl push) ----------
@@ -997,7 +989,9 @@ inline void applyCtrlJson(const uint8_t *data, size_t len) {
 
         bool authoritative = doc["authoritative"] | false;
 
-        if (g_have_rtt_sync && !authoritative) return;
+        // Even an "authoritative" broadcast is a one-way measurement:
+        // delivery delay biases it. Never overwrite an acquired RTT estimate.
+        if (g_have_rtt_sync) return;
 
         int32_t rawDelta = (int32_t)(serverMs - (uint32_t)millis());
         int64_t inst     = (int64_t)rawDelta;
@@ -1311,6 +1305,7 @@ inline void sendClockSyncRequest() {
 
 inline void pollClockSyncResponse() {
     int sz = clockSyncUdp.parsePacket();
+    uint32_t localRxMs = millis();
     if (sz > 0 && gPlayerLogLevel >= 3)
         log_message(String("[SyncRX] got ") + String(sz) + " bytes");
     if (sz <= 0) {
@@ -1345,7 +1340,7 @@ inline void pollClockSyncResponse() {
     if (strcmp(type, "sync_resp") != 0) return;
 
     uint32_t clientTxMs = (uint32_t)(doc["clientTxMs"] | 0UL);
-    if (clientTxMs != g_pending_sync_client_tx_ms) return;
+    if (!g_sync_req_in_flight || clientTxMs != g_pending_sync_client_tx_ms) return;
     g_sync_req_in_flight = false;
 
     int protoVersion = doc["protoVersion"] | 0;
@@ -1354,8 +1349,6 @@ inline void pollClockSyncResponse() {
     uint32_t epoch      = (uint32_t)(doc["epoch"]      | 0UL);
     uint32_t serverRxMs = (uint32_t)(doc["serverRxMs"] | 0UL);
     uint32_t serverTxMs = (uint32_t)(doc["serverTxMs"] | 0UL);
-    uint32_t localRxMs  = millis();
-
     handleServerEpoch(epoch);
 
     int32_t rtt    = (int32_t)(localRxMs - clientTxMs) - (int32_t)(serverTxMs - serverRxMs);
@@ -1381,7 +1374,10 @@ inline void pollClockSyncResponse() {
 
     uint32_t bestRtt = UINT32_MAX;
     int64_t  bestOff = offset;
-    for (int i = 0; i < g_syncRingCount; i++) {
+    // Visit newest first so equal-RTT samples don't pin the offset to an
+    // older clock reading for the full lifetime of the ring.
+    for (int age = 0; age < g_syncRingCount; age++) {
+        int i = (g_syncRingHead + SYNC_RING_SIZE - 1 - age) % SYNC_RING_SIZE;
         if (!g_syncRing[i].valid) continue;
         if (g_syncRing[i].rtt < bestRtt) {
             bestRtt = g_syncRing[i].rtt;
@@ -1438,7 +1434,7 @@ inline void pollClockSyncResponse() {
 // Push a zero-length "please run Opus PLC" message onto the queue for a
 // frame we know we never received. captureMs anchors its playout deadline so
 // the gap doesn't collapse the schedule for frames that follow it.
-inline bool enqueueConcealedFrame(uint32_t captureMs) {
+inline bool enqueueConcealedFrame(uint32_t captureMs, uint32_t seq) {
     if (audio_queue == nullptr) return false;
     // [conceal-guard-full-not-3q]
     // Was `>= (AUDIO_QUEUE_LEN * 3) / 4` = 24/32. Nodes 210/211 showed
@@ -1454,7 +1450,7 @@ inline bool enqueueConcealedFrame(uint32_t captureMs) {
     msg.length      = 0;
     msg.arrival_ms  = millis();
     msg.captured_ms = captureMs;
-    msg.seq         = 0;
+    msg.seq         = seq;
     msg.conceal     = true;
 
     // [conceal-no-evict] If the queue filled between the guard above and
@@ -1473,7 +1469,7 @@ inline bool enqueueConcealedFrame(uint32_t captureMs) {
 // authoritative server-side doc it mirrors). There is no v1 fallback: a
 // datagram that fails the v2 magic+version check is dropped, not
 // reinterpreted as a bare 4-byte-timestamp packet.
-inline void enqueueAudioPacket(const uint8_t *data, size_t len) {
+inline void enqueueAudioPacketLocked(const uint8_t *data, size_t len) {
     if (audio_queue == nullptr) return;
 
     if (g_audio_compat_state != AUDIO_COMPAT_COMPATIBLE) {
@@ -1530,68 +1526,41 @@ inline void enqueueAudioPacket(const uint8_t *data, size_t len) {
 
     if (uxQueueMessagesWaiting(audio_queue) >= (AUDIO_QUEUE_LEN * 3) / 4) {
         stat_packets_dropped++;
-        // Advance expected_seq AND the PLC anchor. If we advance only
-        // expected_seq, the next real gap will synthesize conceal frames
-        // whose captured_ms is anchored to the pre-drop-window value,
-        // putting them hundreds of ms in the past -> AUDIO_STALE_REANCHOR
-        // flush loop on the very next frame. A drop window is still an
-        // inaudible loss; treat it as such for the schedule too.
-        if (seq_initialized) {
-            expected_seq              = seq + 1;
-            last_seq_seen             = seq;
-            last_conceal_captured_ms  = cap;
-        }
+        // Do not advance the baseline: a later accepted packet must account
+        // for the discarded packet just like any other loss.
         return;
     }
 
     // ---- Sequence gap / duplicate / reorder detection ----------------
-    if (!seq_initialized) {
-        seq_initialized = true;
-        expected_seq    = seq + 1;
-        last_seq_seen   = seq;
-        last_conceal_captured_ms = cap;
-    } else {
+    if (seq_initialized) {
         int32_t delta = (int32_t)(seq - expected_seq); // wrap-safe
         if (delta > 0) {
             stat_seq_gaps++;
             stat_seq_missing += (uint32_t)delta;
             uint32_t toConceal = (uint32_t)delta;
-            if (toConceal > AUDIO_MAX_CONCEAL_FRAMES) toConceal = AUDIO_MAX_CONCEAL_FRAMES;
+            if (toConceal > AUDIO_MAX_CONCEAL_FRAMES) {
+                g_force_resync = true;
+                return;
+            }
             uint32_t concealCap = last_conceal_captured_ms;
             const uint32_t frameMs = (OPUS_FRAME_SIZE * 1000UL) / SAMPLE_RATE;
-            uint32_t enqueued = 0;
             for (uint32_t i = 0; i < toConceal; i++) {
                 concealCap += frameMs;
-                if (enqueueConcealedFrame(concealCap)) enqueued++;
-                else break;
+                if (!enqueueConcealedFrame(concealCap, expected_seq)) {
+                    stat_packets_dropped++;
+                    return;
+                }
+                last_seq_seen = expected_seq;
+                expected_seq++;
+                last_conceal_captured_ms = concealCap;
             }
-            // [conceal-truncation-anchor] If the queue was too full to
-            // accept the whole PLC run, we now have a wall-clock gap with
-            // no concealment audio. The next real frame (seq + 1) will
-            // play at its own capture time, jumping the timeline forward
-            // by ~20 ms per skipped conceal frame. If more than a couple
-            // of frames were skipped, re-anchor the decoder/queue so the
-            // audio task re-buffers on the new timeline instead of slowly
-            // slewing the resampler.
-            if (enqueued < toConceal && (toConceal - enqueued) >= 3) {
-                g_force_resync = true;
-            }
-            expected_seq  = seq + 1;
-            last_seq_seen = seq;
         } else if (delta < 0) {
             if (seq == last_seq_seen) stat_seq_duplicate++;
             else                      stat_seq_reordered++;
             stat_frames_discarded++;
             return;
-        } else {
-            expected_seq  = seq + 1;
-            last_seq_seen = seq;
         }
     }
-    last_conceal_captured_ms = cap;
-    stat_seq_received++;
-
-    stat_packets_received++;
 
     AudioMessage msg;
     msg.length      = audioLen;
@@ -1601,15 +1570,30 @@ inline void enqueueAudioPacket(const uint8_t *data, size_t len) {
     msg.conceal     = false;
     memcpy(msg.payload, data + hdrLen, audioLen);
 
-    // [queue-full-drop-newest] The 75%-full guard above already returned
-    // early in every reachable path (single writer, monotonic drain), so
-    // this branch is dead defensively. If it ever fires, drop the NEWEST
-    // frame, not the oldest: evicting the oldest advances the playout
-    // timeline and creates a gap in frames already on the schedule.
-    // expected_seq was advanced above, so the next frame is contiguous.
+    // PLC may have filled the queue after the 75%-full guard. If the real
+    // frame cannot be queued, leave the baseline at the last queued PLC.
     if (xQueueSend(audio_queue, &msg, 0) != pdPASS) {
         stat_packets_dropped++;
+        return;
     }
+    seq_initialized = true;
+    expected_seq = seq + 1;
+    last_seq_seen = seq;
+    last_conceal_captured_ms = cap;
+    stat_seq_received++;
+    stat_packets_received++;
+}
+
+inline void enqueueAudioPacket(const uint8_t *data, size_t len) {
+    if (!g_audio_queue_mutex ||
+        xSemaphoreTake(g_audio_queue_mutex, 0) != pdTRUE) {
+        stat_packets_dropped++;
+        return;
+    }
+    // A packet may already have been read when OTA stopped the sockets.
+    if (!otaNodeUpdating && g_udpSocketsReady)
+        enqueueAudioPacketLocked(data, len);
+    xSemaphoreGive(g_audio_queue_mutex);
 }
 
 // ---- UDP audio drain task (Core 0, high priority) --------------------------

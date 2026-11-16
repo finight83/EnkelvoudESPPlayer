@@ -436,6 +436,8 @@ int16_t* dac2_output_buffer = nullptr;
 // ---- Queues / tasks --------------------------------------------------------
 QueueHandle_t audio_queue        = nullptr;
 TaskHandle_t  audio_task_handle  = nullptr;
+// Serializes queue admission/sequence updates against playback and OTA flushes.
+SemaphoreHandle_t g_audio_queue_mutex = nullptr;
 
 // [audio-config-mutex]
 // Serialises writers (WebServer task: handleSave / handleCancel /
@@ -455,6 +457,15 @@ volatile bool     seq_initialized = false;
 volatile uint32_t expected_seq    = 0;  // next seq we expect to accept in order
 volatile uint32_t last_seq_seen   = 0;  // highest raw seq accepted so far
 volatile uint32_t last_conceal_captured_ms = 0; // capture-time anchor for PLC
+
+inline void resetAudioQueueForOta() {
+    if (!g_audio_queue_mutex) return;
+    xSemaphoreTake(g_audio_queue_mutex, portMAX_DELAY);
+    if (audio_queue) xQueueReset(audio_queue);
+    seq_initialized = false;
+    last_conceal_captured_ms = 0;
+    xSemaphoreGive(g_audio_queue_mutex);
+}
 
 // ---- Stats -----------------------------------------------------------------
 volatile uint32_t stat_packets_oversize = 0;
@@ -548,21 +559,7 @@ volatile uint32_t stat_empty_flushes       = 0;
 volatile int32_t  stat_queue_error         = 0;      // last (depth - target)
 volatile int32_t  stat_correction_samples  = 0;      // last applied sample correction
 
-// [corrector-state-hoisted]
-// Hoisted out of process_and_output_audio()'s function statics so
-// flushAudioQueueAndRebuffer() can zero them. Without the reset, the
-// first 1-2 frames after every rebuffer inherit stale correction
-// values, causing a sub-sample stretch/skip that is audible as a
-// faint click on resync. Volatile because they are read/written from
-// audioPlaybackTask (Core 1) and zeroed from any task holding no lock;
-// alignment is 4B so load/store is atomic on this MCU.
-volatile float    g_correction_smooth      = 0.0f;
-volatile float    g_correction_accum       = 0.0f;
-volatile float    g_queue_drift            = 0.0f;
-// Cumulative absolute correction applied by the soft drift corrector. Was
-// a function-local static in handleGetHealth(); moved here so
-// /api/stats/reset can zero it (the static kept accumulating across a
-// clear, which is why the node's Clear button appeared to do nothing).
+// Kept for API compatibility; no sample correction is currently applied.
 volatile uint32_t stat_total_correction_samples = 0;
 
 // ---- Error counters --------------------------------------------------------

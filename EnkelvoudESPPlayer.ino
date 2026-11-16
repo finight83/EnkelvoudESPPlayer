@@ -79,9 +79,8 @@
       g_auto_expand_ms (cap is AUTO_EXPAND_MAX_MS = 0 — disabled by design,
       the operator's slider is the single authority), sequence/PLC state
       (seq_initialized, expected_seq, last_seq_seen,
-      last_conceal_captured_ms), corrector state
-      (g_correction_smooth/accum, g_queue_drift,
-      stat_total_correction_samples), captured-ms timeline counters
+      last_conceal_captured_ms), legacy corrector diagnostics
+      (stat_total_correction_samples), captured-ms timeline counters
       (statCapturedMsGap*), packet/loss stats (stat_packets_*,
       stat_seq_*, stat_frames_*, stat_late_*), clock-sync stats
       (stat_clock_sync_rtt_ms, stat_clock_resyncs, stat_empty_flushes),
@@ -185,7 +184,7 @@
             discovery fails; never changes the network itself.
 
   EVDPAudio.h
-      I2S bring-up, Opus decode, the drift corrector, crossovers, and the
+      I2S bring-up, Opus decode, crossovers, and the
       playback task. Contains:
         audioLogThrottled — ring-only, rate-limited logger for the audio
             task (avoids blocking UART inside the per-frame budget).
@@ -201,16 +200,15 @@
             the sample call site ([audio-hz-diag-disabled]) for CPU;
             stat_hz_* stay at 0. Re-enable by restoring the
             audioHzDiagSample(left) call.
-        process_and_output_audio — the hot-path function. Applies the
-            drift corrector (with [corrector-deadband-real], [corrector-
-            cap-scales-with-err], [corrector-stuck-watchdog]), master×
-            node×zone gain (no double attenuation — the server already
-            applied master), Catmull-Rom resample to (out_samples), the
+        process_and_output_audio — the hot-path function. The queue-depth
+            corrector is disabled: deadlines do not measure DMA consumption.
+            Applies node×zone gain (no double attenuation — the server already
+            applied master), full-length PCM processing, the
             four crossovers, per-speaker gain, soft-limit, and two
             i2s_write drains. Holds g_audio_config_mutex only for the
             sample-production block; I2S writes are outside the mutex.
         flushAudioQueueAndRebuffer — clears audio_queue, resets the Opus
-            decoder, re-arms seq detection, zeros the corrector, bumps
+            decoder, re-arms seq detection, bumps
             stat_rebuffers (or stat_empty_flushes when the queue was
             already empty).
         slewPlayoutDelay — moves playout_delay_ms toward
@@ -360,7 +358,7 @@
                                  networkTask), otherwise idle
 
   Core 1:
-    audioPlaybackTask pri 3      Opus decode + drift corrector +
+    audioPlaybackTask pri 3      Opus decode + full-length PCM +
                                  crossovers + i2s_write
                                  (sole occupant of Core 1)
 
@@ -597,7 +595,7 @@ void startCaptivePortal();
 void init_i2s();
 void process_and_output_audio(const int16_t* in_pcm, int samples_per_channel);
 // [applyClockTrim-removed] Function was a no-op (unconditionally reset
-// stat_rate_trim_hz=0 every 4 s). Drift is handled by the soft corrector.
+// stat_rate_trim_hz=0 every 4 s). No sample-clock drift controller is active.
 void flushAudioQueueAndRebuffer(const char* reason);
 void handleServerEpoch(uint32_t epoch);
 void postRegister();

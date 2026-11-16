@@ -88,8 +88,8 @@ inline void handleNodeOtaUpload() {
         if (otaNodeUpdating && otaNodeFirmwareReady) {
             log_warn("[OTA] New upload arrived while a complete image is "
                      "pending commit; committing and rebooting.");
-            if (audio_queue) xQueueReset(audio_queue);
             g_udpSocketsReady = false;
+            resetAudioQueueForOta();
             if (Update.end(true)) {
                 bool notified = postOtaResult(true);
                 log_message(String("[OTA] Pending image committed; "
@@ -120,12 +120,13 @@ inline void handleNodeOtaUpload() {
         otaNodeFirmwareReady  = false;
         otaNodeLastActivityMs = millis();
         g_udpSocketsReady     = false;
-        if (audio_queue) xQueueReset(audio_queue);
+        resetAudioQueueForOta();
 
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
             log_warn(String("[OTA] Update.begin failed: ") +
                      Update.errorString() + " — aborting, resuming audio.");
             Update.abort();
+            g_force_rebuffer       = true;
             otaNodeUpdating       = false;
             otaNodeFirmwareReady  = false;
             otaNodeLastActivityMs = 0;

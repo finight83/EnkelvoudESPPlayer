@@ -43,9 +43,7 @@ void setup() {
     }
 
 
-    // Output buffers are eight samples larger than a decoded frame; the
-    // corrector clamps correction to ±1 sample per frame, so eight leaves
-    // headroom for the cubic-interp resampler's tail reads (i0, i1, i2).
+    // Keep eight samples of output-buffer headroom per channel.
     pcm_decode_buffer  = (int16_t*)malloc(OPUS_FRAME_SIZE * CHANNELS * sizeof(int16_t));
     dac1_output_buffer = (int16_t*)malloc((OPUS_FRAME_SIZE + 8) * CHANNELS * sizeof(int16_t));
     dac2_output_buffer = (int16_t*)malloc((OPUS_FRAME_SIZE + 8) * CHANNELS * sizeof(int16_t));
@@ -130,7 +128,11 @@ void setup() {
     if (error == OPUS_OK) log_message("[Opus] Decoder initialized successfully.");
     else                   log_message(String("[Opus] Failed to initialize decoder. Error: ") + error);
 
-    audio_queue = xQueueCreate(AUDIO_QUEUE_LEN, sizeof(AudioMessage));
+    g_audio_queue_mutex = xSemaphoreCreateMutex();
+    if (g_audio_queue_mutex == nullptr)
+        log_warn("[Boot] FAILED to create audio queue mutex; audio disabled.");
+    if (g_audio_queue_mutex)
+        audio_queue = xQueueCreate(AUDIO_QUEUE_LEN, sizeof(AudioMessage));
     if (audio_queue == nullptr) log_message("[Audio] FAILED to create audio queue!");
 
     // Core 1: audio, priority 3. networkTask is priority 4 (higher) on Core 0,
