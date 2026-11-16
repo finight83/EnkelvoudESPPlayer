@@ -1,6 +1,6 @@
 
 // Must match node_X.Y.Z.bin filename on the server side.
-#define FW_VERSION "2.8.6.6"   // 2.8.6.6 — Bug Fixes
+#define FW_VERSION "2.8.6.7"   // Bug Fixes
 
 /*
   ============================================================================
