@@ -652,6 +652,8 @@ inline void audioPlaybackTask(void *pvParameters) {
     AudioMessage msg;
     bool is_buffering = true;
     uint32_t starved_since_ms = 0;
+    uint32_t lastStarveBeatMs = 0;   // reset when a frame is dequeued
+    uint32_t starveStartMs    = 0;
     uint32_t stale_streak = 0;
     // [starve-hold-scales-with-queue]
     // 1500 ms was tuned for a 48-slot queue. With 32 slots and target 3,
@@ -881,6 +883,8 @@ inline void audioPlaybackTask(void *pvParameters) {
             xQueueReceive(audio_queue, &msg, pdMS_TO_TICKS(20)) == pdPASS) {
             g_have_played_audio = true;
             starved_since_ms = 0;
+            starveStartMs    = 0;
+            lastStarveBeatMs = 0;
             slewPlayoutDelay();
 
             // [dwell-default-latency]
@@ -1159,8 +1163,6 @@ inline void audioPlaybackTask(void *pvParameters) {
             // is being diagnosed for jitter.
             if (is_buffering && audio_queue != nullptr &&
                 uxQueueMessagesWaiting(audio_queue) == 0) {
-                static uint32_t lastStarveBeatMs = 0;
-                static uint32_t starveStartMs    = 0;
                 uint32_t now_starve = millis();
                 if (starveStartMs == 0) starveStartMs = now_starve;
                 if (lastStarveBeatMs == 0 ||

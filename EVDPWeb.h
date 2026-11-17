@@ -22,10 +22,11 @@ inline void handleNodeFw() {
 // server (which changes serverIP without changing who is uploading)
 // does not break subsequent pushes.
 static IPAddress otaTrustedUploaderIp(0, 0, 0, 0);
+static bool      otaSessionTrusted = false;
+static IPAddress otaSessionPeerIp(0, 0, 0, 0);
 
 inline void handleNodeOtaUpload() {
     HTTPUpload &up = server.upload();
-    static bool otaSessionTrusted = false;
     static bool otaWriteFailed    = false;
 
     if (up.status == UPLOAD_FILE_START) {
@@ -48,6 +49,7 @@ inline void handleNodeOtaUpload() {
         }
 
         otaSessionTrusted = trusted;
+        otaSessionPeerIp  = trusted ? peerIp : IPAddress(0, 0, 0, 0);
         otaWriteFailed    = false;   // fresh session; forget any prior failure
 
         if (!otaSessionTrusted) {
@@ -165,7 +167,12 @@ inline void handleNodeOtaUpload() {
 }
 
 inline void handleNodeOtaDone() {
+    if (!otaSessionTrusted || server.client().remoteIP() != otaSessionPeerIp) {
+        server.send(403, "application/json", "{\"ok\":false,\"status\":\"untrusted\"}");
+        return;
+    }
     server.sendHeader("Access-Control-Allow-Origin", "*");
+    otaSessionTrusted = false;
     bool ready = otaNodeFirmwareReady && !Update.hasError();
 
     // Not-ready / write-error path: report a real failure to the pusher.
@@ -229,6 +236,25 @@ inline void handleNodeOtaDone() {
 // by gen_gz.py. handleRoot() serves it with Content-Encoding: gzip.
 #include "EVDSET_GZ.h"
 
+// Placeholder sent to the page instead of the stored Wi-Fi password. If the
+// page posts it back unchanged on /save, the stored password is kept.
+static const char EVD_PASS_PLACEHOLDER[] = "__EVD_KEEP_PASS__";
+
+// Same-origin guard for mutating endpoints. Requests without an Origin
+// header (curl, server-side tools) are allowed; browsers always send Origin
+// on cross-origin POSTs, and it must match the Host the node was reached on.
+inline bool evdRejectCrossOrigin() {
+    String origin = server.header("Origin");
+    if (origin.length() == 0) return false;
+    String host = server.header("Host");
+    int p = origin.indexOf("://");
+    String originHost = (p >= 0) ? origin.substring(p + 3) : origin;
+    if (host.length() > 0 && originHost.equalsIgnoreCase(host)) return false;
+    log_warn("[Web] Rejected cross-origin request from " + origin);
+    server.send(403, "application/json", "{\"ok\":false,\"error\":\"cross-origin\"}");
+    return true;
+}
+
 // ---- GET /api/cfg ----------------------------------------------------------
 // [v1.1.2-cfg-fetch]
 // Returns the config JSON the page used to have inlined as `var CFG = {...}`.
@@ -255,7 +281,7 @@ inline void handleApiCfg() {
     evdJsonEscape(mdns_target_host, eServer,   sizeof(eServer));
     evdJsonEscape(sipStr.c_str(),   eServerIp, sizeof(eServerIp));
     evdJsonEscape(wifi_ssid,        eSsid,     sizeof(eSsid));
-    evdJsonEscape(wifi_pass,        ePass,     sizeof(ePass));
+    evdJsonEscape(wifi_pass[0] ? EVD_PASS_PLACEHOLDER : "", ePass, sizeof(ePass));
     evdJsonEscape(static_ip_str,    eIp,       sizeof(eIp));
     evdJsonEscape(static_gw_str,    eGw,       sizeof(eGw));
     evdJsonEscape(static_sn_str,    eSn,       sizeof(eSn));
@@ -491,6 +517,7 @@ inline bool validate_and_update_crossover(float &low, float &high, float max_fre
 }
 
 inline void handlePostVolume() {
+    if (evdRejectCrossOrigin()) return;
     server.sendHeader("Access-Control-Allow-Origin", "*");
     String body = "";
     if (server.hasArg("plain")) body = server.arg("plain");
@@ -1091,6 +1118,7 @@ inline void handleRoot() {
 }
 
 inline void handleCancel() {
+    if (evdRejectCrossOrigin()) return;
     // [ota-gate-cancel]
     // handleCancel() -> loadStoredPreferences() does ~20 NVS reads
     // (20-100 ms) against the same flash chip whose write path
@@ -1103,7 +1131,6 @@ inline void handleCancel() {
     // committed. 503 the button instead; the operator can Revert
     // after the push finishes.
     if (otaNodeUpdating) {
-        server.sendHeader("Access-Control-Allow-Origin", "*");
         server.send(503, "application/json",
                     "{\"ok\":false,\"error\":\"OTA in progress; retry after update\"}");
         return;
@@ -1149,7 +1176,6 @@ inline void handleCancel() {
         }
         if (g_audio_config_mutex) xSemaphoreGive(g_audio_config_mutex);
     }
-    server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "text/plain", "OK");
 }
 
@@ -1255,6 +1281,7 @@ inline void handleNetworkTestStatus() {
 }
 
 inline void handleSave() {
+    if (evdRejectCrossOrigin()) return;
     // [ota-gate-save]
     // handleSave() writes ~11 NVS keys synchronously under g_prefs_mutex
     // and (in both AP and STA paths) ends in ESP.restart(). Each NVS
@@ -1266,7 +1293,6 @@ inline void handleSave() {
     // failure if it starts mid-push. Mirrors [ota-gate-save] on the
     // server side.
     if (otaNodeUpdating) {
-        server.sendHeader("Access-Control-Allow-Origin", "*");
         server.send(503, "application/json",
                     "{\"ok\":false,\"error\":\"OTA in progress; retry after update\"}");
         return;
@@ -1288,7 +1314,9 @@ inline void handleSave() {
         }
         
         server.arg("ssid").toCharArray(pending_ssid, 64);
-        server.arg("pass").toCharArray(pending_pass, 64);
+        if (server.arg("pass") == EVD_PASS_PLACEHOLDER) strncpy(pending_pass, wifi_pass, 63);
+        else server.arg("pass").toCharArray(pending_pass, 64);
+        pending_pass[63] = '\0';
         if (server.hasArg("friendly_name")) server.arg("friendly_name").toCharArray(pending_name, 64);
         else strncpy(pending_name, friendly_name, 64);
         if (server.hasArg("mdns_host")) server.arg("mdns_host").toCharArray(pending_mdns, 64);
@@ -1305,7 +1333,6 @@ inline void handleSave() {
 
         xTaskCreatePinnedToCore(wifiTestTask, "WifiTest", 4096, NULL, 2, NULL, 0);
 
-        server.sendHeader("Access-Control-Allow-Origin", "*");
         server.send(202, "application/json", "{\"state\":\"running\"}");
         return;
     }
@@ -1334,7 +1361,6 @@ inline void handleSave() {
     if (!preferences.begin("audio_node", false)) {
         if (g_prefs_mutex) xSemaphoreGive(g_prefs_mutex);
         log_warn("[Save] NVS begin FAILED - nothing written");
-        server.sendHeader("Access-Control-Allow-Origin", "*");
         server.send(500, "text/plain", "NVS unavailable; nothing saved.");
         return;
     }
@@ -1352,7 +1378,7 @@ inline void handleSave() {
         preferences.putString("ssid", server.arg("ssid"));
         server.arg("ssid").toCharArray(wifi_ssid, 64);
     }
-    if (server.hasArg("pass")) {
+    if (server.hasArg("pass") && server.arg("pass") != EVD_PASS_PLACEHOLDER) {
         preferences.putString("pass", server.arg("pass"));
         server.arg("pass").toCharArray(wifi_pass, 64);
     }
@@ -1526,7 +1552,6 @@ inline void handleSave() {
         if (ssidChanged || passChanged) {
             log_message(String("[Web] Wi-Fi config changed on STA (ssid='") +
                         String(wifi_ssid) + "'); restarting to apply.");
-            server.sendHeader("Access-Control-Allow-Origin", "*");
             server.send(200, "text/plain",
                         "Saved. Node is rebooting to join the new Wi-Fi network.");
             delay(800);
@@ -1594,11 +1619,9 @@ inline void handleSave() {
             "</body></html>",
             urlHtml, urlHtml, urlJs);
         if (w > 0 && w < (int)sizeof(page)) {
-            server.sendHeader("Access-Control-Allow-Origin", "*");
             server.send(200, "text/html; charset=utf-8", page);
             log_message("[Web] AP save complete. Rebooting into STA; browser will follow to " + url);
         } else {
-            server.sendHeader("Access-Control-Allow-Origin", "*");
             server.send(200, "text/plain", "Saved. Node is rebooting to join Wi-Fi.");
             log_message("[Web] AP save complete (redirect page build failed; plain-text fallback).");
         }
@@ -1608,7 +1631,6 @@ inline void handleSave() {
     }
 
     // ---- STA mode, config unchanged (or non-Wi-Fi save) ------------------
-    server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "text/plain", "Saved successfully!");
 }
 
@@ -1721,6 +1743,7 @@ inline void loadStoredPreferences() {
 // rebooting the node. Nothing else is touched: WiFi, the Opus decoder, the
 // playout scheduler, and the queue all keep running. Only the numbers change.
 inline void handleStatsReset() {
+    if (evdRejectCrossOrigin()) return;
     stat_packets_received    = 0;
     stat_packets_dropped     = 0;
     stat_packets_oversize    = 0;
@@ -1825,7 +1848,6 @@ inline void handleStatsReset() {
     portEXIT_CRITICAL(&g_log_ring_mux);
 
     log_warn("[Stats] Counters reset from status page.");
-    server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -1840,6 +1862,8 @@ inline void registerCommonRoutes() {
     if (done) return;
     done = true;
 
+    static const char *kHdrs[] = {"Origin", "Host", "Accept-Encoding"};
+    server.collectHeaders(kHdrs, 3);
     server.on("/api/fw",  HTTP_GET,  handleNodeFw);
     server.on("/api/ota", HTTP_POST, handleNodeOtaDone, handleNodeOtaUpload);
 }

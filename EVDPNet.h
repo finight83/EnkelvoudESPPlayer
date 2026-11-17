@@ -708,8 +708,7 @@ inline bool discoverServerViaUdp(uint32_t timeoutMs) {
     IPAddress mask = WiFi.subnetMask();
     if ((uint32_t)gw != 0 && (uint32_t)mask != 0) {
         uint32_t d = ((uint32_t)gw & (uint32_t)mask) | ~(uint32_t)mask;
-        IPAddress dir2((d >> 24) & 0xFF, (d >> 16) & 0xFF,
-                       (d >>  8) & 0xFF,  d        & 0xFF);
+        IPAddress dir2(d);   // IPAddress's uint32 is little-endian (first octet in low byte)
         bool dup = false;
         for (int i = 0; i < nTargets; ++i)
             if (targets[i] == dir2) dup = true;
@@ -797,8 +796,8 @@ inline void discover_server() {
     if (mdns_target_host[0] && serverIP.fromString(mdns_target_host)) {
         bool isSoftApLiteral = (serverIP == IPAddress(192, 168, 4, 1));
         IPAddress ourIp = WiFi.localIP();
-        bool onSoftApSubnet = ((uint32_t)ourIp & 0xFFFFFF00u) ==
-                              ((uint32_t)IPAddress(192, 168, 4, 1) & 0xFFFFFF00u);
+        bool onSoftApSubnet = ((uint32_t)ourIp & 0x00FFFFFFu) ==
+                              ((uint32_t)IPAddress(192, 168, 4, 1) & 0x00FFFFFFu);
         if (!isSoftApLiteral || onSoftApSubnet || ourIp == IPAddress(0,0,0,0)) {
             serverFound = true;
             log_message(String("[Discovery] Using configured IP: ") +
