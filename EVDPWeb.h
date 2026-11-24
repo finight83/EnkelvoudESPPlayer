@@ -161,6 +161,20 @@ inline void handleNodeOtaUpload() {
             return;
         }
         otaNodeFirmwareReady = true;
+        // [ota-commit-single-shot]
+        // UPLOAD_FILE_END did NOT refresh otaNodeLastActivityMs, so the 90 s
+        // watchdog in EVDPNet.h kept counting from the last WRITE chunk. The
+        // commit is not instant — Update.end(true) erases and verifies a whole
+        // app partition — so a slow commit could be reached by the watchdog
+        // while handleNodeOtaDone() was already inside Update.end(true). Both
+        // paths then call Update.end(true) and ESP.restart() on the same
+        // Update object: the second call returns false on an already-finished
+        // Update, and whichever restarts first can restart mid-verify.
+        //
+        // Refreshing here gives the commit its own full window, and
+        // otaCommitInProgress below makes the commit itself single-shot so
+        // neither path can start a second one.
+        otaNodeLastActivityMs = millis();
         log_message(String("[OTA] Written, ") + up.totalSize +
                     " bytes. Awaiting server notification before commit.");
     }
@@ -195,7 +209,18 @@ inline void handleNodeOtaDone() {
     // 500 to otaPushToNode(), which correctly reports the node update
     // as failed. The pusher's 8 s response-wait cap means it does not
     // block on this flash write.
+    // [ota-commit-single-shot] Claim the commit. If the watchdog already
+    // claimed it, this request is a duplicate and must not touch Update.
+    if (otaCommitInProgress) {
+        server.send(409, "application/json",
+                    "{\"ok\":false,\"status\":\"commit_in_progress\"}");
+        return;
+    }
+    otaCommitInProgress   = true;
+    otaNodeLastActivityMs = millis();
+
     if (!Update.end(true)) {
+        otaCommitInProgress = false;
         log_warn(String("[OTA] Update.end failed: ") + Update.errorString());
         server.send(500, "application/json",
                     "{\"ok\":false,\"status\":\"commit_failed\"}");
@@ -922,6 +947,15 @@ inline void handleGetHealth() {
     doc["framesLate5to20"]    = (uint32_t)stat_late_5to20;
     doc["framesLate20to100"]  = (uint32_t)stat_late_20to100;
     doc["framesLate100to200"] = (uint32_t)stat_late_100to200;
+    // [auto-correction] Counters for the two recovery paths in
+    // audioPlaybackTask(). Without these, "it recovered by itself" and "it
+    // never recovered" look identical from the dashboard.
+    doc["autoRecoverRebuffer"] = (uint32_t)stat_auto_recover_rebuffer;
+    doc["autoRecoverDrain"]    = (uint32_t)stat_auto_recover_drain;
+    // [wire-flag-unicast] Frames addressed to another node (multicast
+    // fallback only). Expected non-zero; a jump here means this node is
+    // hearing traffic it should not have to decode.
+    doc["packetsNotForMe"]     = (uint32_t)stat_packets_not_for_me;
 
     // ---- Stutter diagnostics ---------------------------------------------
     // Per-second packet count and worst inter-arrival gap. A healthy 20 ms
@@ -1247,7 +1281,14 @@ void wifiTestTask(void *pvParameters) {
         WiFi.disconnect(false, false);
         unsigned long t0 = millis();
         while (WiFi.status() != WL_DISCONNECTED && millis() - t0 < 2000) vTaskDelay(pdMS_TO_TICKS(50));
-        WiFi.mode(WIFI_AP); // Revert to AP only
+        // [wifi-test-restore-mode]
+        // This was a bare WiFi.mode(WIFI_AP), which drops the STA interface
+        // entirely. handleSave() is only reachable in AP mode, but a node that
+        // also held a stored STA profile lost its uplink on a FAILED test —
+        // the test is supposed to be a no-op when it fails. Restore the mode
+        // the device was actually in before the test started.
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.begin();   // re-associate with the stored STA credentials, if any
     }
     vTaskDelete(NULL);
 }
@@ -1331,7 +1372,21 @@ inline void handleSave() {
         g_netTestState = NET_TEST_RUNNING;
         g_netTestError[0] = '\0';
 
-        xTaskCreatePinnedToCore(wifiTestTask, "WifiTest", 4096, NULL, 2, NULL, 0);
+        // [wifi-test-task-check]
+        // The return value was ignored. If xTaskCreatePinnedToCore failed
+        // (out of heap during a save is exactly when it would), the state was
+        // already RUNNING and the client polled /api/network/test forever
+        // with no task behind it and no way to retry. Fail loudly instead.
+        BaseType_t created = xTaskCreatePinnedToCore(
+            wifiTestTask, "WifiTest", 4096, NULL, 2, NULL, 0);
+        if (created != pdPASS) {
+            g_netTestState = NET_TEST_FAILED;
+            snprintf(g_netTestError, sizeof(g_netTestError),
+                     "Out of memory starting the connection test");
+            server.send(503, "application/json",
+                        "{\"state\":\"failed\",\"error\":\"task_create_failed\"}");
+            return;
+        }
 
         server.send(202, "application/json", "{\"state\":\"running\"}");
         return;

@@ -647,6 +647,18 @@ inline void slewPlayoutDelay() {
     playout_delay_ms = cur;
 }
 
+// [p2-conceal-watermark]
+// PLC frames spent on stutter absorption in the current second. File scope
+// because the absorb site is deep inside audioPlaybackTask()'s deadline
+// branch, far from the per-second policy block. Decayed (not zeroed) at the
+// rollover so the allowance behaves as a rate and cannot be banked.
+static volatile uint32_t g_plc_absorb_this_sec = 0;
+inline void decayPlcAbsorbAllowance() {
+    const uint32_t step = PLC_ALLOWANCE_PER_SEC / 3;
+    g_plc_absorb_this_sec = (g_plc_absorb_this_sec > step)
+                                ? (g_plc_absorb_this_sec - step) : 0;
+}
+
 // ---- Playback task ---------------------------------------------------------
 inline void audioPlaybackTask(void *pvParameters) {
     AudioMessage msg;
@@ -655,6 +667,8 @@ inline void audioPlaybackTask(void *pvParameters) {
     uint32_t lastStarveBeatMs = 0;   // reset when a frame is dequeued
     uint32_t starveStartMs    = 0;
     uint32_t stale_streak = 0;
+    uint32_t buffer_wait_ms = 0;   // [auto-recover-rebuffer] 0 = not waiting
+    bool force_prebuffer_entry = false;  // [auto-recover-prebuffer-entry]
     // [starve-hold-scales-with-queue]
     // 1500 ms was tuned for a 48-slot queue. With 32 slots and target 3,
     // the buffer empties in ~80 ms, so 1500 ms means the stale-reanchor
@@ -685,6 +699,7 @@ inline void audioPlaybackTask(void *pvParameters) {
 
             if (now_pol - last_policy_ms >= 1000) {
                 last_policy_ms = now_pol;
+                decayPlcAbsorbAllowance();   // [p2-conceal-watermark]
 
                 // [audio-hz-diag-disabled]
                 // Per-second rollover (5 × sqrtf + 5 × log10f, plus the
@@ -797,6 +812,7 @@ inline void audioPlaybackTask(void *pvParameters) {
                 // 60->70->60 every few seconds, which was audible. A
                 // monotonic ratchet cannot oscillate.
                 static int32_t auto_expand_consec = 0;
+                static uint8_t drain_over_secs    = 0;   // [auto-recover-drain]
                 int32_t min_lead = stat_min_lead_last_sec;
                 bool trigger;
                 if (min_lead != 0x7FFFFFFF && min_lead < -3) {
@@ -834,6 +850,30 @@ inline void audioPlaybackTask(void *pvParameters) {
 
 
 
+                // [auto-recover-drain]
+                // The queue has been consistently deeper than the target for
+                // AUTO_RECOVER_DRAIN_SECONDS: the node is carrying seconds of
+                // backlog (typically after a burst the corrector could not
+                // absorb). drop_at() drains one frame at a time, which is a
+                // long audible crunch. Throw the excess away in one step
+                // instead and let the normal playout continue from the
+                // surviving head. This never changes the target, so it cannot
+                // fight the slider or the corrector.
+                if (audio_queue != nullptr) {
+                    UBaseType_t qd = uxQueueMessagesWaiting(audio_queue);
+                    int32_t excess = (int32_t)qd - (int32_t)audio_queue_target;
+                    if (excess >= AUTO_RECOVER_DRAIN_FRAMES) {
+                        if (++drain_over_secs >= AUTO_RECOVER_DRAIN_SECONDS) {
+                            drain_over_secs = 0;
+                            flushAudioQueueAndRebuffer("auto-recover: queue ran away");
+                            stat_auto_recover_drain++;
+                            is_buffering = true;
+                        }
+                    } else {
+                        drain_over_secs = 0;
+                    }
+                }
+
                 applyDelayToQueueTarget(target_playout_delay_ms);
 
                 (void)grow_streak;
@@ -865,18 +905,55 @@ inline void audioPlaybackTask(void *pvParameters) {
 
         if (is_buffering) {
             uint32_t pre  = (uint32_t)audio_prebuffer;
-            uint32_t need = g_have_played_audio ? (uint32_t)audio_queue_target : pre;
+            // [auto-recover-prebuffer-entry]
+            // `g_have_played_audio` stays true for the whole uptime, so every
+            // rebuffer after the first required the FULL queue target before
+            // playout resumed. After an auto-recover re-anchor that is
+            // backwards: we just threw the timeline away and need the
+            // bootstrap prebuffer, not the steady-state target. The flag is
+            // set by the re-anchor below and cleared on the next frame.
+            uint32_t need = (g_have_played_audio && !force_prebuffer_entry)
+                                ? (uint32_t)audio_queue_target : pre;
             if (need < 2) need = 2;
             if (audio_queue != nullptr && uxQueueMessagesWaiting(audio_queue) >= need) {
                 is_buffering  = false;
                 fade_on_resume = true;
                 g_resume_trim  = true;
                 stale_streak   = 0;
+                force_prebuffer_entry = false;
                 playout_delay_ms = target_playout_delay_ms;
             } else {
+                // [auto-recover-rebuffer]
+                // Waiting for the queue to refill is correct for a normal
+                // rebuffer (the target is a few frames, ~60-100 ms). If it
+                // has not refilled after AUTO_RECOVER_REBUFFER_MS the wait is
+                // not going to succeed on its own: the frames that ARE
+                // arriving are being timed against the pre-flush timeline and
+                // are being discarded, so the queue can never reach the
+                // target. Before this, the only way out was a server restart.
+                //
+                // Re-anchor: reset the sequence/lead state exactly as a flush
+                // does, then take whatever arrives as a fresh timeline and
+                // re-enter playout with the prebuffer (not the full target),
+                // so recovery needs 3 frames instead of 5-10.
+                if (buffer_wait_ms == 0) {
+                    buffer_wait_ms = millis();
+                } else if (millis() - buffer_wait_ms >= AUTO_RECOVER_REBUFFER_MS) {
+                    buffer_wait_ms = 0;
+                    flushAudioQueueAndRebuffer("auto-recover: rebuffer stalled");
+                    stat_auto_recover_rebuffer++;
+                    // Prebuffer is the bootstrap target; clear is_buffering so
+                    // the next pass admits audio as soon as `need` frames are
+                    // queued rather than waiting out another hold window.
+                    audio_prebuffer = 3;
+                    is_buffering    = true;
+                    force_prebuffer_entry = true;   // resume on `pre`, not `target`
+                    audioLogThrottled("[Audio] Auto-recover: timeline re-anchored");
+                }
                 vTaskDelay(pdMS_TO_TICKS(2));
                 continue;
             }
+            buffer_wait_ms = 0;
         }
 
         if (audio_queue != nullptr &&
@@ -1050,15 +1127,24 @@ inline void audioPlaybackTask(void *pvParameters) {
                     // flush once auto-expand is exhausted (a persistent
                     // lateness still recovers, a transient hiccup does
                     // not rebuffer).
-                    if (g_auto_expand_ms < AUTO_EXPAND_MAX_MS) {
-                        g_auto_expand_ms += 10;
-                        int newTarget = (int)last_server_buffer_ms + (int)g_auto_expand_ms;
-                        if (newTarget > 400) newTarget = 400;
-                        if (newTarget > target_playout_delay_ms) {
-                            target_playout_delay_ms = newTarget;
-                            audioLogThrottled(String("[AutoExpand] streak: playout ") +
-                                              String(target_playout_delay_ms) + "ms");
-                        }
+                    // [p2-conceal-watermark]
+                    // This branch used to bump g_auto_expand_ms, which is
+                    // capped at AUTO_EXPAND_MAX_MS = 0 — so the condition was
+                    // permanently false and the node went straight to a full
+                    // flush+rebuffer on every run of 3 stale frames. That is
+                    // the audible "crunch then gap" after a short burst.
+                    //
+                    // The ratchet is gone by design (the operator's slider is
+                    // the authority), so the cheap absorb is a bounded amount
+                    // of PLC instead: if we are not already concealing more
+                    // than the watermark allows, synthesise up to
+                    // PLC_ALLOWANCE extra frames rather than throwing the
+                    // queue away. Past the allowance a persistent lateness
+                    // still recovers through the flush below.
+                    if (g_plc_absorb_this_sec < PLC_ALLOWANCE_PER_SEC) {
+                        g_plc_absorb_this_sec += PLC_ALLOWANCE_PER_SEC / 3;
+                        stat_frames_concealed++;
+                        decodeDiscardedAudio(msg);
                         stale_streak = 0;
                         continue;
                     }

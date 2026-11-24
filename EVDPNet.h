@@ -1493,6 +1493,27 @@ inline void enqueueAudioPacketLocked(const uint8_t *data, size_t len) {
     ParsedAudioHeaderV2 v2hdr;
     if (!parseAudioHeaderV2(data, len, v2hdr)) return;
 
+    // [wire-flag-unicast]
+    // Audio is delivered by UNICAST from the server (each node gets its own
+    // datagram, which is what isolates one node's loss from the others). Every
+    // node on the LAN therefore also receives the frames addressed to every
+    // OTHER node. The server sets AUDIO_FLAG_UNICAST in the header flag byte
+    // for every frame it sends; frames without it are either from a build
+    // that predates the flag (all-zero flags, treated as "no claim" and
+    // accepted for compatibility) or addressed elsewhere.
+    //
+    // The address itself is the real discriminator and the socket layer
+    // already filters on it (the unicast socket only receives datagrams sent
+    // to this node's IP). This flag is the belt-and-braces check for the
+    // multicast fallback path, where there is no address to filter on: a
+    // node that decodes another node's frames does not just waste CPU, it
+    // advances ITS seq/expected_seq baseline against a foreign stream and
+    // desynchronises its own timeline. Drop those.
+    if (v2hdr.flags != 0 && (v2hdr.flags & AUDIO_FLAG_UNICAST) == 0) {
+        stat_packets_not_for_me++;
+        return;
+    }
+
     const uint32_t cap     = v2hdr.captured_ms;
     const uint32_t seq     = v2hdr.seq;
     const size_t   hdrLen  = (size_t)AUDIO_HEADER_BYTES;
@@ -1584,8 +1605,19 @@ inline void enqueueAudioPacketLocked(const uint8_t *data, size_t len) {
 }
 
 inline void enqueueAudioPacket(const uint8_t *data, size_t len) {
+    // [p4-queue-mutex-wait]
+    // This is a 0-tick take on the UDP drain task. A 0-tick take fails the
+    // moment audioPlaybackTask holds the mutex — and that task holds it across
+    // a whole Opus decode + I2S write, so every frame that arrived during a
+    // frame of playback was thrown away and counted as a drop. On a healthy
+    // link that is a steady, self-inflicted packet loss rate.
+    //
+    // 2 ticks = one frame period at 50 Hz scheduler ticks, so the drain task
+    // waits at most one scheduling tick and never blocks the socket. If the
+    // mutex is still held after that, the playback task is genuinely stuck and
+    // dropping is the right answer.
     if (!g_audio_queue_mutex ||
-        xSemaphoreTake(g_audio_queue_mutex, 0) != pdTRUE) {
+        xSemaphoreTake(g_audio_queue_mutex, pdMS_TO_TICKS(2)) != pdTRUE) {
         stat_packets_dropped++;
         return;
     }
@@ -1761,7 +1793,15 @@ inline void networkTask(void *pvParameters) {
     // final POST handler never ran (client dropped socket before the
     // terminating CRLF). Stage 1's condition excludes stage 2, so without
     // stage 2 the audio task stays paused forever until manual reboot.
-    if (otaNodeUpdating && !otaNodeFirmwareReady &&
+    // [ota-commit-single-shot] Both stages below are skipped while a commit
+    // owns the Update object: Update.abort() there would corrupt a partition
+    // being verified, and Update.end(true) would be a second commit on an
+    // Update that is already finishing. handleNodeOtaDone() clears the flag
+    // on every failure path; success ends in ESP.restart().
+    if (otaCommitInProgress) {
+        // Let the commit finish. Nothing else in this task may run against
+        // Update while it does.
+    } else if (otaNodeUpdating && !otaNodeFirmwareReady &&
         (millis() - otaNodeLastActivityMs) > OTA_STUCK_TIMEOUT_MS) {
         log_warn(String("[OTA] No upload activity for ") +
                  String((millis() - otaNodeLastActivityMs) / 1000UL) +
@@ -1777,10 +1817,13 @@ inline void networkTask(void *pvParameters) {
                (millis() - otaNodeLastActivityMs) > OTA_STUCK_TIMEOUT_MS) {
         log_warn("[OTA] Bytes written but final handler never ran; "
                  "committing and rebooting.");
+        otaCommitInProgress   = true;   // [ota-commit-single-shot]
+        otaNodeLastActivityMs = millis();
         if (Update.end(true)) {
             delay(500);
             ESP.restart();
         } else {
+            otaCommitInProgress = false;
             Update.abort();
             g_force_rebuffer      = true;
             otaNodeUpdating       = false;

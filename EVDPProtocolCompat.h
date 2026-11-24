@@ -46,6 +46,13 @@
 #define AUDIO_HEADER_BYTES (AUDIO_HDR_MAGIC_BYTES + AUDIO_HDR_VERSION_BYTES + \
                             AUDIO_HDR_FLAGS_BYTES + AUDIO_HDR_SEQ_BYTES +   \
                             AUDIO_HDR_CAPTURED_MS_BYTES) // = 12
+
+// [wire-flag-unicast] Header flag byte (index 3), bit 0. Set by the server on
+// every frame it unicasts to a specific node. A datagram with a NON-ZERO flag
+// byte that lacks this bit was addressed to someone else; an all-zero flag
+// byte comes from a server build that predates the flag and is accepted for
+// compatibility. Mirrors AUDIO_FLAG_UNICAST in the server's EVDUDP.h.
+#define AUDIO_FLAG_UNICAST 0x01
 static_assert(AUDIO_HEADER_BYTES == 12,
               "AUDIO_HEADER_BYTES must stay in sync with parseAudioHeaderV2()");
 

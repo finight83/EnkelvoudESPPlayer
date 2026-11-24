@@ -469,6 +469,9 @@ inline void resetAudioQueueForOta() {
 
 // ---- Stats -----------------------------------------------------------------
 volatile uint32_t stat_packets_oversize = 0;
+// [wire-flag-unicast] Frames whose header said they were addressed to a
+// different node. Non-zero on a healthy network is expected and harmless.
+volatile uint32_t stat_packets_not_for_me = 0;
 volatile uint32_t stat_packets_dropped  = 0;
 volatile uint32_t stat_rebuffers        = 0;
 // [stat-audio-source-rejects]
@@ -531,6 +534,31 @@ volatile int32_t g_auto_expand_ms = 0;
 // deadband fix + encoder complexity 2 eliminated the stutter the auto-
 // expand was added to mask; the extra 100 ms has no remaining upside.
 #define AUTO_EXPAND_MAX_MS 0
+
+// [auto-correction] The "audio degrades and never recovers without a server
+// restart" report. The server's bufferMs is the single authority for the
+// TARGET, but when the pipeline ends up in a bad state nothing ever pulls it
+// back: a flush leaves is_buffering = true, the rebuffer needs
+// audio_queue_target frames, and the queue target is derived from a latency
+// EMA that the flush itself just reset to 20 ms. If the arriving frames are
+// timed against the pre-flush timeline the wait is long, the queue never
+// refills, and the node sits silent until a reboot re-runs the whole
+// handshake.
+//
+// Two independent correctors, both narrow:
+//   * a buffering watchdog that re-anchors the timeline after
+//     AUTO_RECOVER_REBUFFER_MS of an empty queue (the streaming
+//     equivalents are the real fix; this is the floor), and
+//   * a drain corrector that throws away the stale tail when the queue keeps
+//     running away from the target instead of letting drop_at() trickle it
+//     out one frame at a time (which is audible as a long, slow crunch).
+//
+// Neither touches target_playout_delay_ms, so the slider stays the authority.
+#define AUTO_RECOVER_REBUFFER_MS      1200UL  // empty-queue rebuffer before re-anchor
+#define AUTO_RECOVER_DRAIN_FRAMES     6       // queue above target+this for ...
+#define AUTO_RECOVER_DRAIN_SECONDS    2       // ... this many consecutive seconds
+volatile uint32_t stat_auto_recover_rebuffer = 0;  // timeline re-anchors
+volatile uint32_t stat_auto_recover_drain    = 0;  // stale-tail drains
 volatile uint32_t stat_packets_received = 0;
 volatile uint32_t current_i2s_rate      = SAMPLE_RATE;
 
@@ -786,6 +814,10 @@ volatile bool otaNodeUpdating     = false;
 // This is the two-phase-commit signal: "bytes are safely in NVM, await
 // finalize+reboot".
 volatile bool otaNodeFirmwareReady = false;
+// [ota-commit-single-shot] True from the moment Update.end(true) is entered
+// until the restart. Declared here (not in EVDPWeb.h) because EVDPNet.h's
+// stuck-OTA watchdog reads it and is compiled before the web handlers.
+volatile bool otaCommitInProgress = false;
 
 // Timestamp (millis()) of the last OTA upload activity: set on
 // UPLOAD_FILE_START and refreshed on every UPLOAD_FILE_WRITE chunk. The

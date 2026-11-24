@@ -507,6 +507,15 @@
 // the audible sense and should just resync, not flood the queue with PLC.
 #define AUDIO_MAX_CONCEAL_FRAMES  10
 
+// [p2-conceal-watermark]
+// Separate allowance for the PLC used as a stutter ABSORB (repeated-stale-frame
+// path in audioPlaybackTask), distinct from AUDIO_MAX_CONCEAL_FRAMES, which
+// caps how much PLC one sequence gap may synthesize. Six frames = 120 ms of
+// concealment per second: enough to ride out a WiFi jitter burst without the
+// audible crunch-then-gap of a flush+rebuffer, small enough that a genuinely
+// late timeline still trips the flush.
+#define PLC_ALLOWANCE_PER_SEC     6
+
 // How many ms a frame's playout deadline may already have passed before we
 // discard it outright instead of playing it immediately.
 #define AUDIO_STALE_DISCARD_MS      200
