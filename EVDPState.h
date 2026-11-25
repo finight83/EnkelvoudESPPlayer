@@ -201,6 +201,10 @@ volatile bool    g_force_flush_incompatible = false;
 // fire. Set this flag on every non-reboot OTA exit so the task flushes and
 // re-enters buffering immediately.
 volatile bool    g_force_rebuffer = false;
+// [servers-decide] Set when the current server sends the server_standby ctrl
+// (a higher-priority server took over). networkTask drops the contact and
+// re-discovers immediately instead of waiting for the 60 s stale path.
+volatile bool    g_force_rediscovery = false;
 
 // Round-trip (NTP-style) clock sync, authoritative once a sample has been
 // collected (see sendClockSyncRequest()/pollClockSyncResponse() in

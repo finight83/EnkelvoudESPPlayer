@@ -947,6 +947,20 @@ inline void applyCtrlJson(const uint8_t *data, size_t len) {
 
     const char* typeStr = doc["type"] | "";
 
+    // ---------- server_standby: the leader stepped down ----------
+    // [servers-decide] A higher-priority server took over; the one we are
+    // talking to is now a standby that stops answering discovery and audio.
+    // Drop the contact and let networkTask re-discover immediately instead
+    // of waiting for the 60 s stale-contact path.
+    if (strcmp(typeStr, "server_standby") == 0) {
+        if (serverFound) {
+            serverFound          = false;
+            g_force_rediscovery  = true;
+            log_message("[Discovery] server went standby; re-discovering...");
+        }
+        return;
+    }
+
     // ---------- time_sync: only react to real step changes ----------
     // [offset-route-through-setter] Every write to server_clock_offset_ms
     // MUST go through setServerClockOffset() so the (g_sync_local_ms,
@@ -1872,6 +1886,12 @@ inline void networkTask(void *pvParameters) {
       const  unsigned long CONTACT_STALE_MS       = 60000UL;
 
       bool wifiUp = (WiFi.status() == WL_CONNECTED);
+
+      // [servers-decide] The standby notice asked for an immediate re-discovery.
+      if (g_force_rediscovery) {
+        g_force_rediscovery = false;
+        lastDiscoverAttempt = 0;   // bypass the 10 s discovery rate limit
+      }
 
       bool statsFailsGrew = (stat_post_stats_fails > lastStatsFailsSeen);
       bool contactMoved   = (ts_last_server_contact_ms != lastContactSeenMs);
