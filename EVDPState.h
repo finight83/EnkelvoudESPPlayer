@@ -829,14 +829,38 @@ volatile bool otaCommitInProgress = false;
 // the node permanently silent until a manual reboot.
 volatile uint32_t otaNodeLastActivityMs = 0;
 
-// Node-side session fade. Set true at boot and again on every server epoch
-// change (see handleServerEpoch() in EVDPNet.h). The audio playback task
-// consumes it the first time it starts a frame after fade_on_resume; a
-// set flag means "ramp in over 2 s", a clear flag means "short 5 ms join
-// click suppression". This replaces the old g_first_playback flag, which
-// only fired once ever and did nothing for a node that was already playing
-// when the server rebooted under it.
+// Node-side soft start, in two flavours. Both are consumed by the mixer in
+// EVDPAudio.h when fade_on_resume is seen; the flag below selects which.
+//
+//   g_session_fade_needed  true  -> SOFT start (FADE_SOFT_SECS, 2.0 s)
+//                          false -> SHORT declick (FADE_SHORT_SECS, 5 ms)
+//
+// SOFT is set at boot, on every server epoch change (handleServerEpoch() in
+// EVDPNet.h), and on every resume that follows a gap longer than
+// FADE_RESUME_GAP_MS with no audio at all (see audioPlaybackTask's
+// fade_on_resume site, [fade-resume-gap]). That third case is what makes a
+// pause/play on the PC or phone fade in instead of snapping on.
+//
+// SHORT is the fallback: a rebuffer caused by a few dropped datagrams, where
+// a 2 s ramp would be heard as a swell rather than as a soft start.
+//
+// [fade-comment-2s] This comment used to promise "ramp in over 2 s" while the
+// code ramped over 200 ms, so anyone reading it drew the wrong conclusion
+// about how the node sounded. The duration now lives in FADE_SOFT_SECS in
+// EVDPAudio.h and is the single source of truth; this comment no longer
+// states a number it can drift away from.
 volatile bool g_session_fade_needed = true;
+
+// ts_last_audio_packet_ms (defined above) is what audioPlaybackTask reads to
+// tell a long silence from a short one: it is stamped in EVDPNet.h on every
+// VALID datagram, so "now - ts_last_audio_packet_ms" at the moment playout
+// resumes is exactly how long the node had no audio.
+
+// How long the node was silent before the resume that is about to happen.
+// Written by audioPlaybackTask at the fade_on_resume site and read once by
+// the mixer. Kept here rather than as a function-local static so the length of
+// the gap that produced a given ramp is visible in the debugger.
+volatile uint32_t g_resume_gap_ms = 0;
 
 // ---- Logging ring ----------------------------------------------------------
 // Fixed-size ring of char arrays instead of std::vector<String>. The old

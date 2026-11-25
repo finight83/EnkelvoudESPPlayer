@@ -35,6 +35,24 @@ inline void audioLogThrottled(const String &msg) {
     logRingPush(msg);   // ring only — no Serial.println, no UART stall
 }
 
+// ---- Soft start ------------------------------------------------------------
+// [fade-soft-start-2s] Two ramp lengths, chosen per resume. See the mixer's
+// fade_on_resume block for which is used when.
+//
+// FADE_SOFT_SECS was 2.0 s, then shortened to 200 ms by [session-fade-shorter]
+// because a 2 s ramp on a 100 W sub was heard as a low-frequency swell after
+// the node came back. That reasoning holds for a *rebuffer* - audio never
+// really stopped - but not for a pause/play, where the operator is asking for
+// a start and 200 ms is indistinguishable from a hard cut. The two cases are
+// now separated instead of being averaged into one compromise value.
+static const float    FADE_SOFT_SECS     = 2.0f;
+static const float    FADE_SHORT_SECS    = 0.005f;
+// Silence at or above this counts as "the producer stopped", not "a hiccup".
+// 500 ms is ~25 audio frames: far longer than any jitter burst this node is
+// tuned for (rebuffer_hold_ms floors at 250 ms), far shorter than any pause a
+// human makes.
+static const uint32_t FADE_RESUME_GAP_MS = 500;
+
 // ---- I2S init --------------------------------------------------------------
 // [i2s-ready] DAC readiness flags. Exposed via /api/health's i2sDac1Ready /
 // i2sDac2Ready so a dead DAC is visible on the dashboard, not just serial.
@@ -414,21 +432,35 @@ inline void process_and_output_audio(const int16_t* in_pcm, int samples_per_chan
     out_samples = samples_per_channel;
 
     static float fade_gain = 1.0f;
-    static float fade_step = 1.0f / ((float)SAMPLE_RATE * 0.005f);
+    static float fade_step = 1.0f / ((float)SAMPLE_RATE * FADE_SHORT_SECS);
 
     if (fade_on_resume && gain > 0.0f) {
         fade_on_resume = false;
         fade_gain = 0.0f;
-        // [session-fade-shorter] Was 2.0 s on the first post-boot /
-        // post-epoch rebuffer. On a 100 W sub amp a 2 s ramp from
-        // silence to full level is audible as a slow low-frequency
-        // swell — the exact "rumble for a couple of seconds after the
-        // node comes back" profile. 200 ms still suppresses the DAC
-        // click at session start and is short enough that operators
-        // do not describe it as a rumble. The 5 ms path (all
-        // subsequent rebuffers) is unchanged.
-        float fade_secs = g_session_fade_needed ? 0.200f : 0.005f;
+        // [fade-soft-start-2s] A resume is one of two things and they must not
+        // sound the same:
+        //
+        //   SOFT  - the node had NO audio at all for FADE_RESUME_GAP_MS or
+        //           more, or the session is new (boot / server epoch change).
+        //           That is a real stop-then-start: a pause/play on the PC or
+        //           phone, the server restarting, the node coming back from an
+        //           OTA. Ramp over FADE_SOFT_SECS (2.0 s) so it fades in.
+        //
+        //   SHORT - a rebuffer caused by a few dropped datagrams while the
+        //           producer was still sending. Nothing actually stopped, so a
+        //           2 s ramp would be heard as a swell on top of continuous
+        //           audio, not as a soft start. FADE_SHORT_SECS (5 ms) only
+        //           removes the step discontinuity.
+        //
+        // Before this the choice was made on g_session_fade_needed alone, and
+        // that flag is only set at boot and on an epoch change - so a
+        // pause/play, the commonest case of all, took the 5 ms path and was
+        // heard as a hard START. The gap length is measured at the
+        // fade_on_resume site below (see [fade-resume-gap]).
+        bool soft = g_session_fade_needed || (g_resume_gap_ms >= FADE_RESUME_GAP_MS);
+        float fade_secs = soft ? FADE_SOFT_SECS : FADE_SHORT_SECS;
         g_session_fade_needed = false;
+        g_resume_gap_ms = 0;
         fade_step = 1.0f / ((float)SAMPLE_RATE * fade_secs);
     }
 
@@ -918,6 +950,18 @@ inline void audioPlaybackTask(void *pvParameters) {
             if (audio_queue != nullptr && uxQueueMessagesWaiting(audio_queue) >= need) {
                 is_buffering  = false;
                 fade_on_resume = true;
+                // [fade-resume-gap] How long was there no audio at all? This
+                // is the whole difference between "the producer paused and
+                // came back" (soft start) and "a few datagrams were late"
+                // (declick only). ts_last_audio_packet_ms is stamped on every
+                // VALID datagram in EVDPNet.h, so the age of it right now is
+                // the length of the silence that just ended.
+                //
+                // A never-received packet (0) counts as a long gap on purpose:
+                // the very first resume after boot is a session start.
+                g_resume_gap_ms = (ts_last_audio_packet_ms == 0)
+                                      ? 0xFFFFFFFFu
+                                      : (uint32_t)(millis() - ts_last_audio_packet_ms);
                 g_resume_trim  = true;
                 stale_streak   = 0;
                 force_prebuffer_entry = false;

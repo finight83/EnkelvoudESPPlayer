@@ -1,8 +1,6 @@
 
 // Must match node_X.Y.Z.bin filename on the server side.
-// Always update this field with latest patch updates
-#define FW_VERSION "2.8.6.8"   
-// Bug Fixes
+#define FW_VERSION "2.8.6.9"   // Soft start: 2 s fade on resume after a real gap
 
 /*
   ============================================================================
