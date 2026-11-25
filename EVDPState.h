@@ -405,7 +405,6 @@ char g_netTestError[64] = "";
 char pending_ssid[64] = "";
 char pending_pass[64] = "";
 char pending_name[64] = "";
-char pending_mdns[64] = "";
 bool pending_use_static = false;
 char pending_ip[16] = "";
 char pending_gw[16] = "";
@@ -421,7 +420,10 @@ char pending_dns[16] = "";
 // iterations. serverIP is written from serverWatcherTask / discover_server
 // and read from networkTask; it is 4 bytes so access is atomic on this MCU,
 // and .toString() re-reads through a function call, so it is left as-is.
-char mdns_target_host[64] = DEFAULT_MDNS_HOST;
+// [no-server-address-config] There is no configurable "Server address" any
+// more: the node always discovers the server by name (DEFAULT_MDNS_HOST),
+// then UDP broadcast, then the server's SoftAP. This is what stops a node
+// from being stranded on a dead hard-coded IP.
 int  ws_port              = 80;
 IPAddress serverIP;
 volatile bool serverFound   = false;

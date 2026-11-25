@@ -521,12 +521,6 @@ select option{background:#111116;color:#f6f6f8}
         <h2 class="section-title">Wi-Fi</h2>
         <div class="control-card">
           <div class="field">
-            <label for="mdns_host">Server address</label>
-            <input type="text" id="mdns_host" name="mdns_host"
-                   placeholder="192.168.4.1 or Enkelvoud.local"
-                   autocomplete="on" autocapitalize="off" spellcheck="false">
-          </div>
-          <div class="field">
             <label for="ssid">Network name</label>
             <div style="display:flex;gap:8px">
               <input type="text" id="ssid" name="ssid"
@@ -614,7 +608,7 @@ select option{background:#111116;color:#f6f6f8}
 // by bootFromCfg() once the real payload lands.
 var CFG = {
   speakers: [],
-  nodeVolume: 0, name: '', server: '', serverIp: '', serverFound: false,
+  nodeVolume: 0, name: '', serverIp: '', serverFound: false,
   ssid: '', pass: '', useStatic: false, ip: '', gw: '', sn: '', dns: ''
 };
 (function(){
@@ -711,7 +705,6 @@ function ensureTabBuilt(tabId) {
 }
 
 function populateNetworkTab() {
-  $('mdns_host').value     = CFG.server;
   $('ssid').value          = CFG.ssid;
   $('pass').value          = CFG.pass;
   $('use_static').checked  = !!CFG.useStatic;
@@ -1120,23 +1113,17 @@ function bootFromCfg(){
 
   $('server-title-text').textContent = CFG.name || 'Enkelvoud Node';
   $('friendly_name').value = CFG.name || 'Enkelvoud Node';
-  $('nodeSub').textContent = (CFG.name || 'Unnamed node') + ' → ' + (CFG.server || 'no server set');
+  $('nodeSub').textContent = (CFG.name || 'Unnamed node') + ' → ' + (CFG.serverIp ? 'connected' : 'no server');
 
   /* ---- Open Server button ------------------------------------------
-     The node tracks the server's real IP in CFG.serverIp / CFG.serverFound.
-     When serverFound is false (no server seen yet), fall back to the
-     saved host and normalise it the same way handleSave() does. */
+     The node no longer stores a server address; it only knows the server IP
+     it discovered (CFG.serverIp), so the button appears once connected. */
   (function(){
     var btn = $('openServerBtn');
     if (!btn) return;
     var url = '';
     if (CFG.serverFound && CFG.serverIp) {
       url = 'http://' + CFG.serverIp + '/';
-    } else if (CFG.server) {
-      url = CFG.server;
-      if (!/^https?:\/\//i.test(url)) url = 'http://' + url;
-      var host = url.replace(/^https?:\/\//i, '').split('/')[0];
-      if (host.indexOf('.') === -1) url = url.replace(host, host + '.local');
     }
     if (url) { btn.href = url; btn.style.display = ''; }
   })();

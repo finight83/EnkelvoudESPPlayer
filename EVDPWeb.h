@@ -40,12 +40,6 @@ inline void handleNodeOtaUpload() {
                    peerIp == serverIP) {
             trusted = true;
             otaTrustedUploaderIp = peerIp;
-        } else if (mdns_target_host[0]) {
-            IPAddress cfg;
-            if (cfg.fromString(mdns_target_host) && peerIp == cfg) {
-                trusted = true;
-                otaTrustedUploaderIp = peerIp;
-            }
         }
 
         otaSessionTrusted = trusted;
@@ -297,13 +291,12 @@ inline void handleApiCfg() {
     // IPs are IPv4 literals (max 15 chars, no escapable chars) - 48 is fine.
     // Stack cost: 4*385 + 5*48 ≈ 1780 B plus cfg[4096] below, within the
     // WebServer task's budget (typically >= 8 KB).
-    char eName[6 * 64 + 1], eServer[6 * 64 + 1],
+    char eName[6 * 64 + 1],
          eSsid[6 * 64 + 1], ePass[6 * 64 + 1];
     char eServerIp[48];
     char eIp[48], eGw[48], eSn[48], eDns[48];
     String sipStr = serverIP.toString();
     evdJsonEscape(friendly_name,    eName,     sizeof(eName));
-    evdJsonEscape(mdns_target_host, eServer,   sizeof(eServer));
     evdJsonEscape(sipStr.c_str(),   eServerIp, sizeof(eServerIp));
     evdJsonEscape(wifi_ssid,        eSsid,     sizeof(eSsid));
     evdJsonEscape(wifi_pass[0] ? EVD_PASS_PLACEHOLDER : "", ePass, sizeof(ePass));
@@ -321,12 +314,12 @@ inline void handleApiCfg() {
     // handler or revert to a stack buffer and raise the networkTask stack.
     static char cfg[4096];
     int n = snprintf(cfg, sizeof(cfg),
-        "{\"nodeVolume\":%d,\"name\":\"%s\",\"server\":\"%s\","
+        "{\"nodeVolume\":%d,\"name\":\"%s\","
         "\"serverIp\":\"%s\",\"serverFound\":%s,"
         "\"ssid\":\"%s\",\"pass\":\"%s\","
         "\"useStatic\":%s,\"ip\":\"%s\",\"gw\":\"%s\",\"sn\":\"%s\",\"dns\":\"%s\","
         "\"speakers\":[",
-        vol, eName, eServer,
+        vol, eName,
         eServerIp, serverFound ? "true" : "false",
         eSsid, ePass,
         use_static_ip ? "true" : "false", eIp, eGw, eSn, eDns);
@@ -1221,9 +1214,6 @@ inline void saveTestedNetworkSettings() {
     wifi_pass[sizeof(wifi_pass) - 1] = '\0';
     strncpy(friendly_name, pending_name, sizeof(friendly_name) - 1);
     friendly_name[sizeof(friendly_name) - 1] = '\0';
-    strncpy(mdns_target_host, pending_mdns, sizeof(mdns_target_host) - 1);
-    mdns_target_host[sizeof(mdns_target_host) - 1] = '\0';
-
     use_static_ip = pending_use_static;
     strncpy(static_ip_str, pending_ip, sizeof(static_ip_str) - 1);
     static_ip_str[sizeof(static_ip_str) - 1] = '\0';
@@ -1238,7 +1228,6 @@ inline void saveTestedNetworkSettings() {
     preferences.begin("audio_node", false);
     preferences.putBool("configured", true);
     preferences.putString("friendly_name", friendly_name);
-    preferences.putString("mdns_host", mdns_target_host);
     preferences.putString("ssid", wifi_ssid);
     preferences.putString("pass", wifi_pass);
     preferences.putBool("use_static", use_static_ip);
@@ -1360,9 +1349,6 @@ inline void handleSave() {
         pending_pass[63] = '\0';
         if (server.hasArg("friendly_name")) server.arg("friendly_name").toCharArray(pending_name, 64);
         else strncpy(pending_name, friendly_name, 64);
-        if (server.hasArg("mdns_host")) server.arg("mdns_host").toCharArray(pending_mdns, 64);
-        else strncpy(pending_mdns, mdns_target_host, 64);
-        
         pending_use_static = server.hasArg("use_static");
         if (server.hasArg("static_ip"))  server.arg("static_ip").toCharArray(pending_ip, 16); else pending_ip[0] = '\0';
         if (server.hasArg("static_gw"))  server.arg("static_gw").toCharArray(pending_gw, 16); else pending_gw[0] = '\0';
@@ -1424,10 +1410,6 @@ inline void handleSave() {
     if (server.hasArg("friendly_name")) {
         preferences.putString("friendly_name", server.arg("friendly_name"));
         server.arg("friendly_name").toCharArray(friendly_name, 64);
-    }
-    if (server.hasArg("mdns_host")) {
-        preferences.putString("mdns_host", server.arg("mdns_host"));
-        server.arg("mdns_host").toCharArray(mdns_target_host, 64);
     }
     if (server.hasArg("ssid")) {
         preferences.putString("ssid", server.arg("ssid"));
@@ -1620,22 +1602,18 @@ inline void handleSave() {
     // STA. Ship a redirect stub that waits 5 s and follows the node to its
     // new home, then reboot.
     if (was_ap_mode && got_ssid) {
-        String target = server.hasArg("mdns_host") ? server.arg("mdns_host")
-                                                   : String(mdns_target_host);
-        target.trim();
-        if (target.length() == 0) target = String(DEFAULT_MDNS_HOST);
-        String url = target;
+        String url = String(DEFAULT_MDNS_HOST);
         if (!url.startsWith("http://") && !url.startsWith("https://")) url = "http://" + url;
         String hostOnly = url.substring(url.indexOf("://") + 3);
         if (hostOnly.indexOf('.') == -1) url += ".local";
 
-        // [ap-url-js] url can be "http://" + mdns_target_host(64) + ".local"
+        // [ap-url-js] url can be "http://" + DEFAULT_MDNS_HOST + ".local"
         // = ~77 chars; escaped worst case 6*77+1 ≈ 463 B. 128 was under.
         char urlJs[6 * 128 + 1];
         evdJsonEscape(url.c_str(), urlJs, sizeof(urlJs));
 
         // [ap-xss] The URL was previously interpolated into the HTML
-        // attribute context with url.c_str() raw. A `"` inside mdns_host
+        // attribute context with url.c_str() raw. A `"` inside the host
         // (e.g. `evil"><script>alert(1)</script><a href="`) breaks out of
         // the href, giving self-XSS against the operator who typed it.
         // Filter the 4 HTML-significant characters — nothing legitimate
@@ -1698,7 +1676,6 @@ inline void loadStoredPreferences() {
     char localSsid[64]  = "";
     char localPass[64]  = "";
     char localName[64]  = "Enkelvoud Node";
-    char localMdns[64]  = DEFAULT_MDNS_HOST;
     char localIp[16]    = "";
     char localGw[16]    = "";
     char localSn[16]    = "255.255.255.0";
@@ -1717,7 +1694,6 @@ inline void loadStoredPreferences() {
     configured = preferences.getBool("configured", false);
     if (configured) {
         preferences.getString("friendly_name", "Enkelvoud Node").toCharArray(localName, 64);
-        preferences.getString("mdns_host", DEFAULT_MDNS_HOST).toCharArray(localMdns, 64);
         preferences.getString("ssid", "").toCharArray(localSsid, 64);
         preferences.getString("pass", "").toCharArray(localPass, 64);
         localUseStatic = preferences.getBool("use_static", false);
@@ -1778,8 +1754,6 @@ inline void loadStoredPreferences() {
     wifi_pass[sizeof(wifi_pass) - 1] = '\0';
     strncpy(friendly_name, localName, sizeof(friendly_name) - 1);
     friendly_name[sizeof(friendly_name) - 1] = '\0';
-    strncpy(mdns_target_host, localMdns, sizeof(mdns_target_host) - 1);
-    mdns_target_host[sizeof(mdns_target_host) - 1] = '\0';
     use_static_ip = localUseStatic;
     strncpy(static_ip_str,  localIp,  sizeof(static_ip_str)  - 1); static_ip_str[sizeof(static_ip_str)  - 1] = '\0';
     strncpy(static_gw_str,  localGw,  sizeof(static_gw_str)  - 1); static_gw_str[sizeof(static_gw_str)  - 1] = '\0';

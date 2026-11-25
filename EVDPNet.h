@@ -783,34 +783,13 @@ inline void discover_server() {
     serverFound = false;
     ts_last_discovery_attempt_ms = millis();
 
-    // ---- 1. Configured IP literal -----------------------------------------
-    // [discovery-literal-verify] "serverFound = true" on a literal must be
-    // conditional on that literal being plausible for the CURRENT network.
-    // The "192.168.4.1" literal is stamped onto mdns_target_host by
-    // tryJoinServerAccessPoint()/networkTask when the node was last on the
-    // server's SoftAP. If the node then roams to a different LAN, an
-    // unconditional true here means postNodeStats() fails forever and the
-    // stale-contact re-discovery does not fire for 180 s — a multi-minute
-    // silent blackout. Only trust the literal if we are still on 192.168.4/24
-    // or the literal is not the SoftAP address.
-    if (mdns_target_host[0] && serverIP.fromString(mdns_target_host)) {
-        bool isSoftApLiteral = (serverIP == IPAddress(192, 168, 4, 1));
-        IPAddress ourIp = WiFi.localIP();
-        bool onSoftApSubnet = ((uint32_t)ourIp & 0x00FFFFFFu) ==
-                              ((uint32_t)IPAddress(192, 168, 4, 1) & 0x00FFFFFFu);
-        if (!isSoftApLiteral || onSoftApSubnet || ourIp == IPAddress(0,0,0,0)) {
-            serverFound = true;
-            log_message(String("[Discovery] Using configured IP: ") +
-                        serverIP.toString());
-            return;
-        }
-        log_message("[Discovery] Saved 192.168.4.1 literal but our IP is " +
-                    ourIp.toString() + "; falling through to UDP.");
-    }
+    // [no-server-address-config] There is no user-configurable server
+    // address any more (it was how a node ended up stranded on a dead static
+    // IP). Discovery is always: fixed mDNS name, UDP broadcast, SoftAP.
 
-    // ---- 2. Configured mDNS hostname --------------------------------------
-    if (mdns_target_host[0]) {
-        String host = String(mdns_target_host);
+    // ---- 1. Fixed mDNS server name ----------------------------------------
+    {
+        String host = String(DEFAULT_MDNS_HOST);
         if (!host.endsWith(".local") && host.indexOf('.') == -1)
             host += ".local";
         IPAddress mdnsIp = MDNS.queryHost(host.c_str());
@@ -825,11 +804,11 @@ inline void discover_server() {
                     ", falling back to UDP");
     }
 
-    // ---- 3. UDP broadcast --------------------------------------------------
+    // ---- 2. UDP broadcast --------------------------------------------------
     log_message("[Discovery] Broadcasting UDP DISCOVER (5 s)...");
     if (discoverServerViaUdp(5000)) return;
 
-    // ---- 4. We are already on the server's AP? -----------------------------
+    // ---- 3. We are already on the server's AP? -----------------------------
     if (WiFi.SSID() == String(SERVER_AP_SSID)) {
         serverIP    = IPAddress(192, 168, 4, 1);
         serverFound = true;
@@ -837,7 +816,7 @@ inline void discover_server() {
         return;
     }
 
-    // ---- 5. Full diagnostic dump ------------------------------------------
+    // ---- 4. Full diagnostic dump ------------------------------------------
     // If we got here, none of the above worked. Print everything a user
     // needs to figure out whether the server is on another network, the
     // AP is isolating clients, or the server process simply isn't up.
@@ -854,8 +833,6 @@ inline void discover_server() {
                 WiFi.broadcastIP().toString());
     log_message(String("[Discovery]   our RSSI     : ") +
                 String(WiFi.RSSI()) + " dBm");
-    log_message(String("[Discovery]   configured   : '") +
-                String(mdns_target_host) + "'");
     log_message("[Discovery] Check that:");
     log_message("[Discovery]   a) the server is powered on and past its own boot,");
     log_message("[Discovery]   b) the server is on this same Wi-Fi, not its own AP,");
@@ -885,8 +862,6 @@ inline bool tryJoinServerAccessPoint() {
     while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(300); attempts++; }
     if (WiFi.status() != WL_CONNECTED) { log_message("[WiFi] Server AP not reachable."); return false; }
 
-    strncpy(mdns_target_host, "192.168.4.1", sizeof(mdns_target_host) - 1);
-    mdns_target_host[sizeof(mdns_target_host) - 1] = '\0';
     log_message(String("[WiFi] Joined server AP. IP: ") + WiFi.localIP().toString());
     return true;
 }
@@ -2273,9 +2248,9 @@ inline void serverWatcherTask(void *pvParameters) {
 // every 60 s and reports:
 //   - whether the server's own SoftAP "Enkelvoud Server" is in range
 //   - what we actually need to do to fix it
-// It never changes networks on its own. Switching the node to the server's
-// AP is a user decision: point the Server address field at 192.168.4.1
-// via the node's web UI, or bring the server onto this Wi-Fi.
+// It never changes networks on its own. There is no Server address field any
+// more, so the fix is either to bring the server onto this Wi-Fi, or let the
+// node join the server's own SoftAP (tryJoinServerAccessPoint()).
 inline void serverProbeTask(void *pvParameters) {
     (void)pvParameters;
 
@@ -2312,9 +2287,9 @@ inline void serverProbeTask(void *pvParameters) {
                 log_message("[Probe] The server is NOT on this network. Either:");
                 log_message(String("[Probe]   a) put the server on '") +
                             WiFi.SSID() + "', or");
-                log_message(String("[Probe]   b) open http://") +
-                            WiFi.localIP().toString() +
-                            "/ and set Server address to 192.168.4.1");
+                log_message(String("[Probe]   b) let the node join \"") +
+                            String(SERVER_AP_SSID) +
+                            "\" (it retries automatically), or move it here");
             } else {
                 log_message(String("[Probe] Server AP not visible either ")
                             + "(scanned " + String(otherAps) +

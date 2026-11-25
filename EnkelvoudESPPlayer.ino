@@ -63,7 +63,7 @@
 
   EVDPState.h
       Every mutable global: WiFi credentials (wifi_ssid, wifi_pass,
-      friendly_name, mdns_target_host, static IP fields), I2S pin constants
+      friendly_name, static IP fields), I2S pin constants
       (const int pin_lrc_1 etc. — duplicated from EVDPConfig.h by design,
       the values must stay identical), speaker array (speakers[4]) + filter
       array (speaker_filters[4]), live audio state (node_volume_multiplier,
