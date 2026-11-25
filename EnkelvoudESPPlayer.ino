@@ -1,6 +1,6 @@
 
 // Must match node_X.Y.Z.bin filename on the server side.
-#define FW_VERSION "2.8.6.9"   // Soft start: 2 s fade on resume after a real gap
+#define FW_VERSION "2.8.7.0"   // No Server address: always mDNS/UDP discovery
 
 /*
   ============================================================================
