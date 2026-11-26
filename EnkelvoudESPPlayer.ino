@@ -1,6 +1,6 @@
 
 // Must match node_X.Y.Z.bin filename on the server side.
-#define FW_VERSION "2.8.7.1"   // server_standby ctrl -> immediate re-discovery
+#define FW_VERSION "2.8.8.0"   // master recording (PSRAM) + glass UI + standby re-discovery
 
 /*
   ============================================================================
