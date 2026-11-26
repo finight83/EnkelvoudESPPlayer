@@ -589,9 +589,7 @@ select option{background:#111116;color:#f6f6f8}
           <button type="button" class="nav-btn active" onclick="openTab(event, 'p-audio')">Audio</button>
           <button type="button" class="nav-btn"        onclick="openTab(event, 'p-network')">Network</button>
           <button type="button" class="nav-btn"        id="statusBtn"
-                  title="Open node health &amp; logs in a new tab">Status</button>
-          <button type="button" class="nav-btn"        id="revertBtn">Revert</button>
-          <button type="button" class="nav-btn nav-btn-primary" id="saveBtn">Save</button>
+                  title="Open node health &amp; logs">Status</button>
         </nav>
 
         <div class="top-actions">
@@ -1092,7 +1090,9 @@ function buildSpeakers(list){
 
 /* ---- node status ---- */
 $('statusBtn').addEventListener('click', function(){
-  window.open('/status', '_blank', 'noopener');
+  // Same window, like moving between tabs: the Status page is a separate
+  // document, and a plain navigation keeps the browser back button usable.
+  window.location.href = '/status';
 });
 
 /* ---- save / revert ---- */
@@ -1118,7 +1118,7 @@ window.saveName = function() {
   document.getElementById('friendly_name').value = newName;
   document.getElementById('server-title-text').textContent = newName;
   closeNameModal();
-  document.getElementById('saveBtn').click(); // Triggers the save sequence
+  scheduleSave();                             // auto-save writes it back
 };
 
 var nameInput = document.getElementById('edit-name-input');
@@ -1131,30 +1131,42 @@ if (nameInput) {
   });
 }
 
-/* ---- save / revert ---- */
-$('saveBtn').addEventListener('click', function(){
-  var btn = this;
-  var orig = btn.textContent;
-  btn.disabled = true; btn.textContent = 'Saving…';
+/* ---- auto-save -----------------------------------------------------------
+   Save and Revert are gone: every settings change is written back once the
+   operator has been idle for ~1 s. The delay is not cosmetic - each /save
+   erases flash (NVS), so a slider drag must never produce a write per pixel.
+   A payload identical to the last saved one is skipped entirely. */
+var saveTimer = null, saveInFlight = false, saveDirty = false, lastSavedBody = null;
 
-  var fd = new FormData($('setupForm'));
+function formBody() {
+  return new URLSearchParams(new FormData($('setupForm'))).toString();
+}
 
-  post('/save', {method:'POST', body:new URLSearchParams(fd)})
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(performSave, 1000);
+}
+
+function performSave() {
+  if (saveInFlight) { saveDirty = true; return; }
+  var body = formBody();
+  if (body === lastSavedBody) return;
+  saveInFlight = true;
+  post('/save', {method:'POST', body:new URLSearchParams(body)})
     .then(function(r){
       if (r.status === 202) {
-        // AP mode: connection test started
-        showBusy('Testing connection…');
+        // AP mode: connection test started, the node will reboot if it joins.
+        showBusy('Testing connection\u2026');
         var pollTest = function() {
           fetch('/api/network-test', { cache: 'no-store' })
             .then(function(res){ return res.json(); })
             .then(function(d){
               if (d.state === 'success') {
-                showBusy('Connected! Rebooting…');
+                showBusy('Connected! Rebooting\u2026');
                 setTimeout(function(){ location.reload(); }, 5000);
               } else if (d.state === 'failed') {
                 hideBusy();
                 toast('Connection failed: ' + d.error, 'err');
-                btn.disabled = false; btn.textContent = orig;
               } else {
                 setTimeout(pollTest, 500);
               }
@@ -1163,34 +1175,31 @@ $('saveBtn').addEventListener('click', function(){
         };
         pollTest();
       } else {
-        toast('Saved to flash', 'ok');
-        btn.disabled = false; btn.textContent = orig;
+        lastSavedBody = body;
+        toast('Saved', 'ok');
       }
     })['catch'](function(e){
       hideBusy();
       toast('Not saved: ' + e.message, 'err');
-      btn.disabled = false; btn.textContent = orig;
+    })
+    .then(function(){
+      saveInFlight = false;
+      if (saveDirty) { saveDirty = false; scheduleSave(); }
     });
+}
+
+/* Delegated, so lazily built tabs are covered without touching each builder. */
+document.addEventListener('input', function(e){
+  var el = e.target;
+  if (!el || !el.closest || !el.closest('#setupForm')) return;
+  // Typed fields wait for blur (the change event): in AP setup a 1 s pause
+  // mid-SSID or mid-password must not start a connection test.
+  var kind = (el.type || '').toLowerCase();
+  if (kind === 'text' || kind === 'password' || kind === 'number') return;
+  scheduleSave();
 });
-
-$('revertBtn').addEventListener('click', function(){
-  var btn = this;
-  btn.disabled = true;
-
-  // Full-screen loading overlay while we tell the node to discard the
-  // in-page edits and reload from the last-saved config. Two stages:
-  // first we wait on /cancel, then we swap the text as the browser
-  // navigates back to /. The overlay hides itself on error so the user
-  // can retry.
-  showBusy('Reverting to saved settings…');
-  post('/cancel', {method:'POST'}).then(function(){
-    showBusy('Reloading…');
-    setTimeout(function(){ location.reload(); }, 450);
-  })['catch'](function(e){
-    hideBusy();
-    toast('Could not revert: ' + e.message, 'err');
-    btn.disabled = false;
-  });
+document.addEventListener('change', function(e){
+  if (e.target && e.target.closest && e.target.closest('#setupForm')) scheduleSave();
 });
 
 /* ---- boot from server-fetched config ----------------------------------
@@ -1492,6 +1501,25 @@ h1{font-size:1.3rem;font-weight:700;
                    background: rgba(255,255,255,0.07) !important; color: var(--text) !important; }
     input, select { background: rgba(0,0,0,0.25) !important; border: 1px solid var(--hair) !important;
                     border-radius: 10px !important; color: var(--text) !important; }
+
+    /* This page keeps its own chrome; the palette alone left the galaxy
+       backdrop, gradient title and neon controls visible. */
+    .galaxy-bg { display: none !important; }
+    h1 { background: none !important; -webkit-text-fill-color: currentColor !important;
+         color: #fff !important; text-shadow: none !important; font-weight: 650 !important; }
+    .section-title { letter-spacing: .12em; }
+    .controls { background: rgba(255,255,255,0.055) !important;
+                border: 1px solid var(--hair) !important; border-radius: 18px !important; }
+    .btn-start { background: linear-gradient(135deg,#9db6ff,#b48cff) !important;
+                 border: none !important; color: #0b0a16 !important; box-shadow: none !important; }
+    .btn-start.active { background: #ff6b81 !important; color: #0b0a16 !important; }
+    .btn-clear { background: rgba(255,255,255,0.07) !important;
+                 border: 1px solid var(--hair) !important; color: var(--text) !important; }
+    #logs, #rawHealth { background: rgba(0,0,0,0.28) !important;
+                        border: 1px solid var(--hair) !important; border-radius: 16px !important; }
+    .err-panel { background: rgba(255,255,255,0.045) !important;
+                 border: 1px solid var(--hair) !important; border-radius: 18px !important; }
+    .card .v { text-shadow: none !important; }
 
 </style>
 </head>
