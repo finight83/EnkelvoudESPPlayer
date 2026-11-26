@@ -1676,25 +1676,43 @@ inline void handleSave() {
             urlHtml[j] = '\0';
         }
 
-        char page[1100];
+        // [ap-page-theme] Raw string literal: the page is mostly CSS, and
+        // escaped literals are exactly what broke the build when the theme
+        // was inserted here before. The only '%' characters in it are the
+        // three format slots, and no CSS percentage value is used.
+        // static, not stack: ~2.5 KB on the web-server task stack is tight,
+        // and this handler runs on the single WebServer task.
+        static char page[3072];
         int w = snprintf(page, sizeof(page),
-            "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<title>Connecting&#8230;</title>"
-            "<style>body{margin:0;min-height:100vh;background:#070710;color:#f2f4f8;"
-            "font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
-            "display:flex;align-items:center;justify-content:center;padding:20px;text-align:center}"
-            "h1{font-size:1.15rem;font-weight:650;margin:0 0 10px}"
-            "p{color:#9aa3b8;margin:0 0 14px}"
-            "a{color:#25c8f0;text-decoration:none;font-weight:600}</style>"
-            "</head><body><div>"
-            "<h1>Saving to flash&#8230;</h1>"
-            "<p>Your node is rebooting and joining your Wi&#8209;Fi network.</p>"
-            "<p>Redirecting to the server&#8230;</p>"
-            "<p><a href=\"%s\">Open %s now</a></p>"
-            "</div>"
-            "<script>setTimeout(function(){window.location.href=\"%s\";},5000);</script>"
-            "</body></html>",
+            R"HTML(<!DOCTYPE html><html><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connecting&#8230;</title>
+<style>
+:root{--text:#f4f5fb;--muted:#b3b9d1;--hair:rgba(255,255,255,.12)}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;color:var(--text);
+  background:
+    radial-gradient(600px 600px at 72px 0px, rgba(75,43,255,.45) 0, transparent 420px),
+    radial-gradient(700px 700px at right bottom, rgba(31,143,255,.30) 0, transparent 500px),
+    #07070f;
+  font:16px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  display:flex;align-items:center;justify-content:center;padding:24px;text-align:center}
+.card{width:420px;max-width:calc(100vw - 48px);padding:28px 24px;
+  background:rgba(255,255,255,.055);border:1px solid var(--hair);border-radius:22px;
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+h1{font-size:1.15rem;font-weight:650;margin:0 0 10px;letter-spacing:-.01em}
+p{color:var(--muted);margin:0 0 14px;font-size:.95rem}
+a{display:inline-block;margin-top:4px;padding:10px 18px;border-radius:999px;
+  background:linear-gradient(135deg,#9db6ff,#b48cff);color:#0b0a16;
+  text-decoration:none;font-weight:650}
+</style></head><body><div class="card">
+<h1>Saving to flash&#8230;</h1>
+<p>Your node is rebooting and joining your Wi&#8209;Fi network.</p>
+<p>Redirecting to the server&#8230;</p>
+<p><a href="%s">Open %s now</a></p>
+</div>
+<script>setTimeout(function(){window.location.href="%s";},5000);</script>
+</body></html>)HTML",
             urlHtml, urlHtml, urlJs);
         if (w > 0 && w < (int)sizeof(page)) {
             server.send(200, "text/html; charset=utf-8", page);
