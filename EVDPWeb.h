@@ -431,6 +431,51 @@ inline void handleGetLogs() {
     server.send(200, "application/json", json);
 }
 
+// GET /api/rec_report?recId=... - stream the master-recording capture.
+// The lines live in PSRAM, and the body is flushed in ~1 KB chunks so no large
+// JSON String is ever allocated on the internal heap while audio is playing.
+inline void handleRecReport() {
+    String want = server.arg("recId");
+    if (!recReady() || (want.length() && want != recId())) {
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(404, "application/json",
+                    "{\"ok\":false,\"error\":\"no capture\"}");
+        return;
+    }
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", "");
+
+    char head[256];
+    snprintf(head, sizeof(head),
+             "{\"recId\":\"%s\",\"nodeId\":\"%s\",\"name\":\"%s\","
+             "\"startedMs\":%u,\"endedMs\":%u,\"dropped\":%u,\"lines\":[",
+             recId().c_str(), WiFi.macAddress().c_str(), WiFi.getHostname(),
+             (unsigned)recStartMs(), (unsigned)recEndMs(),
+             (unsigned)recDropped());
+    server.sendContent(head);
+
+    String buf;
+    buf.reserve(1024);
+    uint32_t n = recCount();
+    for (uint32_t i = 0; i < n; i++) {
+        char esc[MAX_LOG_LINE_LEN * 6 + 1];
+        evdJsonEscape(recLine(i), esc, sizeof(esc));
+        if (i) buf += ',';
+        buf += '"';
+        buf += esc;
+        buf += '"';
+        if (buf.length() >= 900) {      // keep the transient String small
+            server.sendContent(buf);
+            buf = "";
+        }
+    }
+    buf += "]}";
+    server.sendContent(buf);
+    server.sendContent("");            // terminate the chunked response
+}
+
 inline void handleCORS() {
 
     server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -1911,6 +1956,8 @@ inline void registerAppRoutes() {
     server.on("/api/volume",  HTTP_POST, handlePostVolume);
     server.on("/api/volume",  HTTP_OPTIONS, handleCORS);
     server.on("/api/logs",    HTTP_GET,  handleGetLogs);
+    // [master-rec] Server-driven recording capture (EVDPRec.h / EVDPNet.h)
+    server.on("/api/rec_report", HTTP_GET, handleRecReport);
     server.on("/api/health",  HTTP_GET,  handleGetHealth);
     server.on("/api/cfg",     HTTP_GET,  handleApiCfg);      // [v1.1.2-cfg-fetch]
     server.on("/api/stats/reset", HTTP_POST, handleStatsReset);

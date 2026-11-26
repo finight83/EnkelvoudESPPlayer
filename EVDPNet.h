@@ -11,7 +11,11 @@
 // having included <Update.h> first. Keeps the header compilable in
 // isolation (host-side tooling, future .cpp extractions).
 #include <Update.h>
-
+// [master-rec] Server-driven recording buffer (EVDPRec.h, included below the
+// log helpers it calls). Declared here so logRingPush() can feed it.
+static inline void recMaybeAppend(const char *line);
+static inline bool recStart(const String &id);
+static inline void recStop();
 // [log-ring-lock]
 // logRingPush is called from four tasks across both cores:
 //   - networkTask       (Core 0): registration / discovery / stats
@@ -55,6 +59,11 @@ inline void logRingPush(const String &msg) {
     system_log_head = (system_log_head + 1) % MAX_LOG_LINES;
     if (system_log_count < MAX_LOG_LINES) system_log_count++;
     portEXIT_CRITICAL(&g_log_ring_mux);
+
+    // [master-rec] Mirror the line into the recording buffer. Outside the log
+    // ring's critical section: the 160-byte PSRAM copy must not extend the
+    // hold time seen by the audio tasks.
+    recMaybeAppend(buf);
 }
 
 // [v1.1.1-log-string-ref]
@@ -74,6 +83,8 @@ inline void log_warn(const String &msg) {
     Serial.println(msg);
     logRingPush(msg);
 }
+
+#include "EVDPRec.h"        // [master-rec] needs log_warn/log_message above
 
 // ---- Sanitize node name ----------------------------------------------------
 inline String sanitizeNodeName(const String &value) {
@@ -625,6 +636,18 @@ inline void postRegister() {
             g_force_reregister = true;
         }
     }
+
+    // [master-rec] One-shot ack: tells the server this node accepted rec_start
+    // and will serve /api/rec_report. networkTask (core 0) does the POST so
+    // the audio task never blocks on HTTP.
+    if (g_recAckPending) {
+        g_recAckPending = false;
+        char ack[96];
+        int an = snprintf(ack, sizeof(ack), "{\"recId\":\"%s\"}", g_recId.c_str());
+        if (an > 0 && an < (int)sizeof(ack)) {
+            postJson("/api/player/rec_ack", ack, (size_t)an, nullptr);
+        }
+    }
 }
 
 inline void postNodeStats() {
@@ -946,6 +969,17 @@ inline void applyCtrlJson(const uint8_t *data, size_t len) {
     }
 
     const char* typeStr = doc["type"] | "";
+
+    // ---------- master recording: start/stop the PSRAM capture ----------
+    // Unicast like server_standby and handled before the host_audio_sync
+    // target gate. Old firmware ignores the unknown type.
+    if (strcmp(typeStr, "rec_start") == 0 || strcmp(typeStr, "rec_stop") == 0) {
+        String recId = doc["recId"] | "";
+        if (recId.length() == 0 || recId.length() > 64) return;
+        if (strcmp(typeStr, "rec_start") == 0) recStart(recId);
+        else                                    recStop();
+        return;
+    }
 
     // ---------- server_standby: the leader stepped down ----------
     // [servers-decide] A higher-priority server took over; the one we are
