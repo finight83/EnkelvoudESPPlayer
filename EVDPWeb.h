@@ -1285,8 +1285,12 @@ inline void saveTestedNetworkSettings() {
 }
 
 void wifiTestTask(void *pvParameters) {
+    // Remember the radio mode: a test-only run from a station node must not
+    // switch on an unconfigured AP, and a failed test must restore exactly
+    // what the node was doing before.
+    const wifi_mode_t prevMode = WiFi.getMode();
     // Stay in AP+STA so the user's browser doesn't disconnect during the test
-    WiFi.mode(WIFI_AP_STA);
+    WiFi.mode(g_netTestOnly ? prevMode : WIFI_AP_STA);
     
     if (pending_use_static) {
         IPAddress ip, gw, sn, dns;
@@ -1305,10 +1309,21 @@ void wifiTestTask(void *pvParameters) {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        saveTestedNetworkSettings();
-        g_netTestState = NET_TEST_SUCCESS;
-        vTaskDelay(pdMS_TO_TICKS(2000)); // Let frontend see success before rebooting
-        ESP.restart();
+        if (g_netTestOnly) {
+            // [wifi-test-only] Network-tab test: credentials work, but nothing
+            // is saved. Return the radio to the stored profile (a no-op when
+            // there is none) and keep the AP up so the page survives.
+            g_netTestState = NET_TEST_SUCCESS;
+            vTaskDelay(pdMS_TO_TICKS(400));
+            WiFi.disconnect(false, false);
+            WiFi.mode(prevMode);
+            WiFi.begin();
+        } else {
+            saveTestedNetworkSettings();
+            g_netTestState = NET_TEST_SUCCESS;
+            vTaskDelay(pdMS_TO_TICKS(2000)); // Let frontend see success before rebooting
+            ESP.restart();
+        }
     } else {
         snprintf(g_netTestError, sizeof(g_netTestError), "Failed to connect to %s", pending_ssid);
         g_netTestState = NET_TEST_FAILED;
@@ -1321,9 +1336,10 @@ void wifiTestTask(void *pvParameters) {
         // also held a stored STA profile lost its uplink on a FAILED test —
         // the test is supposed to be a no-op when it fails. Restore the mode
         // the device was actually in before the test started.
-        WiFi.mode(WIFI_AP_STA);
+        WiFi.mode(prevMode);
         WiFi.begin();   // re-associate with the stored STA credentials, if any
     }
+    g_netTestOnly = false;   // the next run decides its own mode
     vTaskDelete(NULL);
 }
 
@@ -1353,6 +1369,58 @@ inline void handleNetworkTestStatus() {
     json += "}";
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "application/json", json);
+}
+
+// [wifi-test-only] POST /api/wifi/test - prove the SSID/password without
+// touching flash. The page polls the existing /api/network-test for the result.
+inline void handleWifiTest() {
+    if (evdRejectCrossOrigin()) return;
+    if (otaNodeUpdating) {
+        server.send(503, "application/json",
+                    "{\"state\":\"failed\",\"error\":\"ota_in_progress\"}");
+        return;
+    }
+    if (g_netTestState == NET_TEST_RUNNING) {
+        server.send(429, "application/json", "{\"state\":\"running\"}");
+        return;
+    }
+
+    String candidate = server.hasArg("ssid") ? server.arg("ssid") : String();
+    candidate.trim();
+    if (!candidate.length()) {
+        server.send(400, "application/json",
+                    "{\"state\":\"failed\",\"error\":\"ssid_required\"}");
+        return;
+    }
+
+    candidate.toCharArray(pending_ssid, sizeof(pending_ssid));
+    pending_ssid[sizeof(pending_ssid) - 1] = '\0';
+    if (server.hasArg("pass") && server.arg("pass") != EVD_PASS_PLACEHOLDER) {
+        server.arg("pass").toCharArray(pending_pass, sizeof(pending_pass));
+        pending_pass[sizeof(pending_pass) - 1] = '\0';
+    } else {
+        strncpy(pending_pass, wifi_pass, sizeof(pending_pass) - 1);
+        pending_pass[sizeof(pending_pass) - 1] = '\0';
+    }
+    pending_name[0] = '\0';
+    pending_use_static = false;      // this tests the radio link only
+
+    g_netTestOnly  = true;
+    g_netTestError[0] = '\0';
+    g_netTestState = NET_TEST_RUNNING;
+
+    BaseType_t created = xTaskCreatePinnedToCore(
+        wifiTestTask, "WifiTest", 4096, NULL, 2, NULL, 0);
+    if (created != pdPASS) {
+        g_netTestOnly  = false;
+        g_netTestState = NET_TEST_FAILED;
+        snprintf(g_netTestError, sizeof(g_netTestError),
+                 "Out of memory starting the connection test");
+        server.send(503, "application/json",
+                    "{\"state\":\"failed\",\"error\":\"task_create_failed\"}");
+        return;
+    }
+    server.send(202, "application/json", "{\"state\":\"running\"}");
 }
 
 inline void handleSave() {
@@ -1400,6 +1468,7 @@ inline void handleSave() {
         if (server.hasArg("static_sn"))  server.arg("static_sn").toCharArray(pending_sn, 16); else pending_sn[0] = '\0';
         if (server.hasArg("static_dns")) server.arg("static_dns").toCharArray(pending_dns, 16); else pending_dns[0] = '\0';
 
+        g_netTestOnly = false;   // AP save persists on success: not a test
         g_netTestState = NET_TEST_RUNNING;
         g_netTestError[0] = '\0';
 
@@ -1969,6 +2038,7 @@ inline void registerAppRoutes() {
     server.on("/scan",        HTTP_GET,  handleScanNetworks);
     server.on("/save",        HTTP_POST, handleSave);
     server.on("/api/network-test", HTTP_GET, handleNetworkTestStatus);
+    server.on("/api/wifi/test",   HTTP_POST, handleWifiTest);
     server.on("/cancel",      HTTP_POST, handleCancel);
     server.on("/api/volume",  HTTP_GET,  handleGetVolume);
     server.on("/api/volume",  HTTP_POST, handlePostVolume);

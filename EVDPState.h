@@ -406,6 +406,11 @@ enum NetTestState { NET_TEST_IDLE, NET_TEST_RUNNING, NET_TEST_SUCCESS, NET_TEST_
 volatile NetTestState g_netTestState = NET_TEST_IDLE;
 char g_netTestError[64] = "";
 
+// [wifi-test-only] True when the Network tab's Test button started the task:
+// the credentials are proven, then the stored profile is restored - nothing is
+// written to NVS and the node does not reboot.
+bool g_netTestOnly = false;
+
 char pending_ssid[64] = "";
 char pending_pass[64] = "";
 char pending_name[64] = "";

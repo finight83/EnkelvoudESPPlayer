@@ -657,6 +657,18 @@ select option{background:#111116;color:#f6f6f8}
             </div>
           </div>
         </div>
+
+        <div class="control-card">
+          <div class="row" style="gap:10px;flex-wrap:wrap;align-items:center;justify-content:flex-start">
+            <button type="button" class="btn btn-primary" id="netSaveBtn">Save network</button>
+            <button type="button" class="btn" id="netTestBtn">Test connection</button>
+            <span class="muted" id="netTestState" style="font-size:.85rem"></span>
+          </div>
+          <p class="muted" style="font-size:.82rem;margin:10px 0 0">
+            Network settings are not auto-saved. Saving rejoins the new network and can reboot the node;
+            testing briefly moves the radio to the entered network.
+          </p>
+        </div>
       </section>
     </form>
   </div>
@@ -1147,10 +1159,10 @@ function scheduleSave() {
   saveTimer = setTimeout(performSave, 1000);
 }
 
-function performSave() {
+function performSave(force) {
   if (saveInFlight) { saveDirty = true; return; }
   var body = formBody();
-  if (body === lastSavedBody) return;
+  if (!force && body === lastSavedBody) return;
   saveInFlight = true;
   post('/save', {method:'POST', body:new URLSearchParams(body)})
     .then(function(r){
@@ -1192,6 +1204,7 @@ function performSave() {
 document.addEventListener('input', function(e){
   var el = e.target;
   if (!el || !el.closest || !el.closest('#setupForm')) return;
+  if (el.closest('#p-network')) return;   // network has its own Save button
   // Typed fields wait for blur (the change event): in AP setup a 1 s pause
   // mid-SSID or mid-password must not start a connection test.
   var kind = (el.type || '').toLowerCase();
@@ -1199,7 +1212,53 @@ document.addEventListener('input', function(e){
   scheduleSave();
 });
 document.addEventListener('change', function(e){
-  if (e.target && e.target.closest && e.target.closest('#setupForm')) scheduleSave();
+  var el = e.target;
+  if (!el || !el.closest || !el.closest('#setupForm')) return;
+  if (el.closest('#p-network')) return;   // saved by the Network tab buttons
+  scheduleSave();
+});
+
+/* ---- network tab: explicit save + connection test ---------------------- */
+$('netSaveBtn').addEventListener('click', function(){ performSave(true); });
+
+$('netTestBtn').addEventListener('click', function(){
+  var ssid = ($('ssid').value || '').trim();
+  var label = $('netTestState');
+  if (!ssid) { toast('Enter a network name first', 'err'); return; }
+  var btn = this;
+  btn.disabled = true;
+  if (label) label.textContent = 'testing\u2026';
+  var body = new URLSearchParams();
+  body.set('ssid', ssid);
+  body.set('pass', $('pass').value);
+  post('/api/wifi/test', {method:'POST', body:body})
+    .then(function(r){ return r.json(); })
+    .then(function(){
+      var poll = function(){
+        fetch('/api/network-test', {cache:'no-store'})
+          .then(function(res){ return res.json(); })
+          .then(function(d){
+            if (d.state === 'success') {
+              if (label) label.textContent = 'connected';
+              toast('Wi-Fi test passed', 'ok');
+              btn.disabled = false;
+            } else if (d.state === 'failed') {
+              if (label) label.textContent = 'failed';
+              toast('Test failed: ' + (d.error || 'wrong SSID or password'), 'err');
+              btn.disabled = false;
+            } else {
+              setTimeout(poll, 500);
+            }
+          })
+          ['catch'](function(){ setTimeout(poll, 700); });
+      };
+      poll();
+    })
+    ['catch'](function(e){
+      if (label) label.textContent = 'failed';
+      toast('Test could not start: ' + e.message, 'err');
+      btn.disabled = false;
+    });
 });
 
 /* ---- boot from server-fetched config ----------------------------------
