@@ -1782,6 +1782,20 @@ inline void udpAudioTask(void *pvParameters) {
           rxCmdbuf[n] = '\0';
           if (srcIp == serverIP) {
             applyCtrlJson(rxCmdbuf, (size_t)n);
+          } else if (strstr((const char *)rxCmdbuf, "\"server_ready\"") &&
+                     (!serverFound ||
+                      (ts_last_server_contact_ms != 0 &&
+                       (millis() - ts_last_server_contact_ms) > 2500UL))) {
+            // [servers-decide] Our server went quiet and the next one is
+            // announcing itself. Adopt it and re-register immediately.
+            // Only accepted while the current server is stale, so a LAN
+            // spoof cannot hijack a node that is streaming normally.
+            log_message(String("[Discovery] ") + srcIp.toString() +
+                        " is the next server; re-registering");
+            serverIP                  = srcIp;
+            serverFound               = true;
+            ts_last_server_contact_ms = millis();
+            g_force_reregister        = true;
           } else {
             static uint32_t lastBadCtrlLogMs = 0;
             if (millis() - lastBadCtrlLogMs > 1000) {
