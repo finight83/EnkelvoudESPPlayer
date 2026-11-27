@@ -239,7 +239,8 @@
             via pending_*_save flags.
         handleGetHealth — GET /api/health; 114 keys, 6144 B doc pool,
             OOM-guarded serialize.
-        handleStatusPage — GET /status (serves EVDSET_STATUS_PAGE).
+        handleStatusPage — GET /status; 302 to /#status. The status view
+            is a tab inside the root page now, not a second document.
         handleRoot — GET /; serves EVDSET_HTML_GZ (or the raw
             EVDSET_PAGE_HTML if the client does not Accept-Encoding:gzip).
         handleCancel — POST /cancel; OTA-gated, loadStoredPreferences() +
@@ -268,7 +269,9 @@
             live page is rendered by the JS bootFromCfg() from GET /api/cfg,
             not by server-side string substitution, so this file is
             gzip-friendly.
-        EVDSET_STATUS_PAGE — the standalone /status page (PROGMEM).
+            The Status tab (system / network / encoder / stutter / audio cards,
+            problem counters, log tail, 10-minute recorder) lives inside
+            this same page.
       Do not edit EVDSET_PAGE_HTML without regenerating EVDSET_GZ.h.
 
   EVDSET_GZ.h  (generated; not attached)
